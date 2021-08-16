@@ -2,3 +2,6 @@
 
 from .t32run import Podbus
 from .t32run import Trace32Subprocess
+
+del t32run
+del common

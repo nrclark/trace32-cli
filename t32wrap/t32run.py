@@ -14,10 +14,154 @@ import typing
 import platform
 import glob
 import time
+import threading
 
 from .common import make_tempdir
 
 # --------------------------------------------------------------------------- #
+
+
+def add_doc(value):
+    """ Decorator that adds a docstring to a function. """
+    def _doc(func):
+        func.__doc__ = value
+        return func
+    return _doc
+
+
+class ThreadedPopen(sp.Popen):
+    """ Subclass of subprocess.Popen that connects stdin, stdout, and sterr
+    to thread-serviced pipes. Stdin can be sent with write_stdin(). Stdout
+    and Stderr can be received with read_stdout() and read_stderr(). Threads
+    are transparently created and terminated. """
+
+    def __init__(self, *args, **kwargs):
+        self._shutdown = False
+        self._threads = []
+        self._queues = {
+            'ctrl': queue.Queue(),
+            'stdin': queue.Queue(),
+            'stdout': queue.Queue(),
+            'stderr': queue.Queue()
+        }
+
+        kwargs['stdin'] = sp.PIPE
+        kwargs['stdout'] = sp.PIPE
+        kwargs['stderr'] = sp.PIPE
+        kwargs['bufsize'] = 0
+
+        super().__init__(*args, **kwargs)
+        self._buftype = type(self.stdout.read(0))
+
+        args = (self.stdout, self._queues['stdout'], "read")
+        thread = threading.Thread(target=self._service_pipe, args=args)
+        self._threads.append(thread)
+
+        args = (self.stderr, self._queues['stderr'], "read")
+        thread = threading.Thread(target=self._service_pipe, args=args)
+        self._threads.append(thread)
+
+        args = (self.stdin, self._queues['stdin'], "write")
+        thread = threading.Thread(target=self._service_pipe, args=args)
+        self._threads.append(thread)
+
+        for thread in self._threads:
+            thread.start()
+
+    def _shutdown_pipes(self):
+        if self._shutdown is False:
+            self._queues['stdin'].put(self._buftype())
+            for pipe in [self.stdin, self.stdout, self.stderr]:
+                pipe.close()
+            self._shutdown = True
+
+    @add_doc(sp.Popen.terminate.__doc__)
+    def terminate(self, *args, **kwargs):
+        super().terminate(*args, **kwargs)
+        self._shutdown_pipes()
+
+    @add_doc(sp.Popen.kill.__doc__)
+    def kill(self, *args, **kwargs):
+        super().kill(*args, **kwargs)
+        self._shutdown_pipes()
+
+    @add_doc(sp.Popen.wait.__doc__)
+    def wait(self, timeout=None):
+        result = super().wait(timeout=timeout)
+        self._shutdown_pipes()
+        return result
+
+    @add_doc(sp.Popen.communicate.__doc__)
+    def communicate(self, input=None, timeout=None):
+        # pylint: disable=redefined-builtin
+        if input:
+            self.write_stdin(input)
+        result = super().communicate(input=None, timeout=timeout)
+        self._shutdown_pipes()
+        return result
+
+    @add_doc(sp.Popen.poll.__doc__)
+    def poll(self):
+        result = super().poll()
+        if result is not None:
+            self._shutdown_pipes()
+        return result
+
+    @staticmethod
+    def _service_pipe(iopipe, ioqueue, direction):
+        if direction == "read":
+            while True:
+                try:
+                    data = iopipe.read(2**16)
+                    ioqueue.put(data)
+                # pylint: disable=bare-except
+                except:
+                    break
+
+        elif direction == "write":
+            while True:
+                try:
+                    data = ioqueue.get()
+                    ioqueue.task_done()
+                    iopipe.write(data)
+                # pylint: disable=bare-except
+                except:
+                    break
+
+    def _read_queue(self, ioqueue):
+        """ Reads all blocks of data from one of the internal ioqueues, joins
+        them together, and returns the result. """
+
+        blocks = []
+        try:
+            while True:
+                if ioqueue.empty():
+                    break
+
+                blocks.append(ioqueue.get_nowait())
+                ioqueue.task_done()
+        except queue.Empty:
+            pass
+
+        return self._buftype().join(blocks)
+
+    def write_stdin(self, data):
+        """ Writes a block of data to the Trace32 subprocess. Can be called
+        prior to launching run() if desired. """
+
+        self._queues['stdin'].put(data)
+
+    def read_stdout(self):
+        """ Gets all data waiting in the Trace32 subprocess's stdout queue,
+        and returns it as a single string. """
+
+        return self._read_queue(self._queues['stdout'])
+
+    def read_stderr(self):
+        """ Gets all data waiting in the Trace32 subprocess's stderr queue,
+        and returns it as a single string. """
+
+        return self._read_queue(self._queues['stderr'])
 
 
 class Podbus(enum.Enum):
@@ -38,20 +182,15 @@ class Trace32Subprocess:
         self.t32dir = self._find_trace32_dir(trace32_bin)
         self.t32bin = self._find_program(trace32_bin, self.t32dir)
 
-        self.buftype = str
         self._tempdir_obj = make_tempdir()
         self.tempdir = self._tempdir_obj.name
 
         self.config_file = os.path.join(self.tempdir, "trace32.cfg")
+        self.returncode = None
+        self._stop_request = False
+
         with open(self.config_file, "w") as outfile:
             outfile.write(self._genconfig(gui, podbus))
-
-        self._queues = {
-            'ctrl': queue.Queue(),
-            'stdin': queue.Queue(),
-            'stdout': queue.Queue(),
-            'stderr': queue.Queue()
-        }
 
     @staticmethod
     def _get_port(port: typing.Optional[int] = None):
@@ -211,17 +350,19 @@ class Trace32Subprocess:
     def stop(self):
         """ Shuts down trace32 by sending SIGTERM to the subprocess, followed
         by SIGKILL if it didn't respond to SIGTERM. """
+        self._stop_request = True
 
-        self._queues['ctrl'].put("stop")
+    def run(self, pollrate=0.05):
+        """ Runs {self.t32bin} as a subprocess with pipe-connected stdin,
+        stdout, and stderr attached to thread-serviced queues. Uses a polling
+        loop to wait for the subprocess to finish, and returns the errcode.
 
-    def run(self, program, args=(), pollrate=0.025):
-        """ Runs {program} as a subprocess, with pipe-connected stdin, stdout,
-        and stderr. Supplies data from a queue into stdin. Reads stdout/stderr
-        to queues. Can be signalled to terminate by stop(). This function is
-        suitable for running in a background thread to support cross-platform
-        nonblocking I/O. """
+        can be accessed with self.stdin(), self.stdout(), and self.stderr()
+        respectively. Can be signalled to terminate by self.stop(). This
+        function is suitable for running in a background thread to support
+        cross-platform nonblocking I/O. """
 
-        cmd = [program] + args
+        cmd = [self.t32bin, "-c", self.config_file]
         timeout = 0
 
         if 'CREATE_NEW_PROCESS_GROUP' in dir(sp):
@@ -231,75 +372,27 @@ class Trace32Subprocess:
             extra_arg = {"start_new_session": True}
 
         self.dummy_socket.close()
-        popen = sp.Popen(cmd, bufsize=0, stdin=sp.PIPE, stdout=sp.PIPE,
-                         stderr=sp.PIPE, encoding="latin-1", *extra_arg)
+        popen = ThreadedPopen(cmd, bufsize=0, stdin=sp.PIPE, stdout=sp.PIPE,
+                              stderr=sp.PIPE, **extra_arg)
 
-        self.buftype = type(popen.stdout.read(0))
+        timeout = None
 
         while True:
-            if self._queues['ctrl'].empty() is False:
-                ctrl = self._queues['ctrl'].get()
-                if ctrl not in ['stop']:
-                    raise ValueError(f"Unknown control command [{ctrl}]")
-
+            if self._stop_request:
                 popen.terminate()
                 timeout = time.time() + 2
 
             if timeout and (time.time() > timeout):
-                timeout = 0
+                timeout = None
                 popen.kill()
-                progname = os.path.dirname(program)
+                progname = os.path.basename(self.t32bin)
                 sys.stderr.write(f"Issued SIGKILL to {progname}.\n")
 
-            buffer = popen.stdout.read(2**16)
-            if buffer:
-                self._queues['stdout'].put(buffer)
-
-            buffer = popen.stderr.read(2**16)
-            if buffer:
-                self._queues['stderr'].put(buffer)
-
-            if self._queues['stdin'].empty() is False:
-                buffer = self._queues['stdin'].get()
-                popen.stdin.write(buffer)
+            try:
+                popen.wait(timeout=pollrate)
+            except sp.TimeoutExpired:
+                pass
 
             if popen.poll() is not None:
+                self.returncode = popen.returncode
                 return popen.returncode
-
-            time.sleep(pollrate)
-
-    def stdin(self, data):
-        """ Writes a block of data to the Trace32 subprocess. Can be called
-        prior to launching run() if desired. """
-
-        self._queues['stdin'].put(data)
-
-    def stdout(self):
-        """ Gets all data waiting in the Trace32 subprocess's stdout queue,
-        and returns it as a single string. """
-        blocks = []
-        try:
-            while True:
-                if self._queues['stdout'].empty():
-                    break
-
-                blocks.append(self._queues['stdout'].get_nowait())
-        except queue.Empty:
-            pass
-
-        return self.buftype().join(blocks)
-
-    def stderr(self):
-        """ Gets all data waiting in the Trace32 subprocess's stderr queue,
-        and returns it as a single string. """
-        blocks = []
-        try:
-            while True:
-                if self._queues['stderr'].empty():
-                    break
-
-                blocks.append(self._queues['stderr'].get_nowait())
-        except queue.Empty:
-            pass
-
-        return self.buftype().join(blocks)
