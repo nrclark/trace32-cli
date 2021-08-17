@@ -101,6 +101,7 @@ class CallFailure(ApiError):
     """ Exception class used to report Trace32 API calls that were sent
     successfully, but returned an error from the remote Trace32 instance. """
 
+
 class CommandFailure(Exception):
     """ Exception class used to report that a PRACTICE command failed. Contains
     the failing command, and also some data about the error. """
@@ -112,6 +113,7 @@ class CommandFailure(Exception):
 
     def __str__(self):
         return self.error
+
 
 class ScriptFailure(Exception):
     """ Exception class used to report that a PRACTICE script failed. Contains
@@ -333,27 +335,6 @@ class Trace32API:
             script_dir = os.path.abspath(os.path.dirname(__file__))
             libfile = os.path.join(script_dir, "_t32api.so")
 
-        self._tempstore = []
-        for varname in ["TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"]:
-            if varname in os.environ and os.path.isdir(os.environ[varname]):
-                tempdir_base = os.environ.get(varname)
-                break
-        else:
-            self._tempstore.append(tempfile.TemporaryDirectory())
-            tempdir_base = self._tempstore[-1].name
-
-        self._tempstore.append(tempfile.TemporaryDirectory(dir=tempdir_base))
-        self.tempdir = self._tempstore[-1].name
-
-        fifo_name = os.path.join(self.tempdir, "area.fifo")
-        os.mkfifo(fifo_name)
-        fd = os.open(fifo_name, os.O_RDONLY | os.O_NONBLOCK)
-        self.fifo = os.fdopen(fd, 'r')
-        self.fifo.read(4096)
-        self.fifo_name = fifo_name
-        self.area = None
-        self.connected = False
-
         libfile = os.path.abspath(libfile)
         self.dll = ctypes.cdll.LoadLibrary(libfile)
         self.dll = _dll_init_generic(self.dll)
@@ -553,21 +534,52 @@ class Trace32API:
 
         self.dll.T32_Break()
 
+
+class Trace32Interface:
+    """ Ctypes-based wrapper around useful Trace32 CAPI functions. Adds some
+    argument management, standardized error-checking, etc. """
+    # pylint: disable=invalid-name
+
+    def __init__(self, libfile=None):
+        self.api = Trace32API(libfile)
+
+        self.area = None
+        self.connected = False
+        self._tempstore = []
+
+        for varname in ["TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"]:
+            if varname in os.environ and os.path.isdir(os.environ[varname]):
+                tempdir_base = os.environ.get(varname)
+                break
+        else:
+            self._tempstore.append(tempfile.TemporaryDirectory())
+            tempdir_base = self._tempstore[-1].name
+
+        self._tempstore.append(tempfile.TemporaryDirectory(dir=tempdir_base))
+        self.tempdir = self._tempstore[-1].name
+
+        fifo_name = os.path.join(self.tempdir, "area.fifo")
+        os.mkfifo(fifo_name)
+        fd = os.open(fifo_name, os.O_RDONLY | os.O_NONBLOCK)
+        self.fifo = os.fdopen(fd, 'r')
+        self.fifo.read(4096)
+        self.fifo_name = fifo_name
+
     def connect(self, node="localhost", port=20000, packlen=None, timeout=10):
         """ Connect to a Trace32 instance. """
 
-        self.T32_Config("NODE=", node)
-        self.T32_Config("PORT=", port)
+        self.api.T32_Config("NODE=", node)
+        self.api.T32_Config("PORT=", port)
 
         if packlen:
-            self.dll.T32_Config("PACKLEN=", packlen)
+            self.api.T32_Config("PACKLEN=", packlen)
 
         init_ok = False
         maxtime = time.time() + timeout
 
         while time.time() < maxtime:
             try:
-                self.T32_Init()
+                self.api.T32_Init()
                 init_ok = True
                 break
             except CommunicationError as err:
@@ -577,10 +589,10 @@ class Trace32API:
         if not init_ok:
             raise last_exception
 
-        register_cleanup(self.T32_Exit)
+        register_cleanup(self.api.T32_Exit)
 
-        self.T32_Attach()
-        self.T32_Ping()
+        self.api.T32_Attach()
+        self.api.T32_Ping()
 
         name = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(8)]
         self.area = ''.join(name)
@@ -595,7 +607,7 @@ class Trace32API:
             pass
 
         for cmd in cmds:
-            self.T32_Cmd(cmd)
+            self.api.T32_Cmd(cmd)
 
         self.connected = True
 
@@ -614,38 +626,42 @@ class Trace32API:
             cmds.append("QUIT")
 
         for cmd in cmds:
-            self.T32_Cmd(cmd)
+            self.api.T32_Cmd(cmd)
 
-        self.T32_Exit()
+        self.api.T32_Exit()
         self.connected = False
+
+    def ping(self):
+        """ Checks to make sure that the API is connected and active. """
+        self.api.T32_Ping()
 
     def read_memory(self, address, length, address_width=64):
         """ Reads a block of data from the target's memory-space and
         returns it. """
 
         buffer = ctypes.create_string_buffer(length)
-        self.dll.read_memory(address, address_width, buffer, length)
+        self.api.dll.read_memory(address, address_width, buffer, length)
         return buffer.raw
 
     def write_memory(self, address, data, address_width=64):
         """ Writes a block of data to the target's memory-space. """
         assert isinstance(data, bytes)
-        self.dll.write_memory(address, address_width, data, len(data))
+        self.api.dll.write_memory(address, address_width, data, len(data))
 
     def clear_area(self):
         """ Clears the current AREA, and drops any data pending in the input
         FIFO (which is connected to that AREA). Set the message-string to
         a detectable flag-value, and return that value. """
 
-        self.T32_Cmd(f"AREA.CLEAR {self.area}")
-        self.T32_Cmd(f"AREA.Select {self.area}")
+        self.api.T32_Cmd(f"AREA.CLEAR {self.area}")
+        self.api.T32_Cmd(f"AREA.Select {self.area}")
         while self.fifo.read(4096):
             pass
 
         chars = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(16)]
         flag_message = f"Semaphore {''.join(chars)}"
-        self.T32_Cmd(f'Print %AREA A000 "{flag_message}"')
-        message_string = self.T32_GetMessageString()
+        self.api.T32_Cmd(f'Print %AREA A000 "{flag_message}"')
+        message_string = self.api.T32_GetMessageString()
         assert message_string['msg'] == flag_message
         return flag_message
 
@@ -663,21 +679,21 @@ class Trace32API:
             raise ValueError(err_msg % scriptfile)
 
         msgline_flag = self.clear_area()
-        self.T32_ExecuteCommand(f"DO {os.path.abspath(scriptfile)}")
+        self.api.T32_ExecuteCommand(f"DO {os.path.abspath(scriptfile)}")
 
         try:
             while True:
-                practice_state = self.T32_GetPracticeState()
+                practice_state = self.api.T32_GetPracticeState()
                 if practice_state == PracticeState.Idle:
                     break
                 output = self.fifo.read(4096)
                 if logfile:
                     logfile.write(output)
                 buffer += output
-                time.sleep(0.1)
+                time.sleep(0.025)
         except KeyboardInterrupt as err:
-            self.T32_Stop()
-            raise err
+            self.api.T32_Stop()
+            raise KeyboardInterrupt from err
 
         # After running the script, a random string is generated and printed
         # to the Trace32 AREA. This flag is then detected using until_keyword()
@@ -686,10 +702,10 @@ class Trace32API:
 
         flag = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(16)]
         flag = "".join(flag)
-        self.T32_Cmd(f'PRINT %AREA {self.area} "{flag}"')
+        self.api.T32_Cmd(f'PRINT %AREA {self.area} "{flag}"')
 
-        fetcher = until_keyword(self.fifo, flag, maxblock=4096, poll_rate=0.05)
-        for chunk in fetcher:
+        for chunk in until_keyword(self.fifo, flag, maxblock=4096,
+                                   poll_rate=0.05):
             if logfile:
                 logfile.write(chunk)
 
@@ -698,7 +714,7 @@ class Trace32API:
         while self.fifo.read(4096):
             pass
 
-        message_string = self.T32_GetMessageString()
+        message_string = self.api.T32_GetMessageString()
         if message_string['msg'] != msgline_flag:
             buffer += "\n" + message_string['msg']
             err_types = [MessageType.Error, MessageType.Error_Info]
@@ -730,13 +746,14 @@ class Trace32API:
         the result to a logfile as its received. """
 
         self.clear_area()
+        self.api.T32_ExecuteCommand(cmd)
 
-        self.T32_ExecuteCommand(cmd)
         flag = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(16)]
         flag = "".join(flag)
-        self.T32_Cmd(f'PRINT %AREA {self.area} "{flag}"')
+        self.api.T32_Cmd(f'PRINT %AREA {self.area} "{flag}"')
 
-        fetcher = until_keyword(self.fifo, flag, maxblock=4096, poll_rate=0.05)
+        fetcher = until_keyword(self.fifo, flag, maxblock=4096,
+                                poll_rate=0.05)
         buffer = ""
         for chunk in fetcher:
             if logfile:
@@ -747,6 +764,10 @@ class Trace32API:
         while self.fifo.read(4096):
             pass
 
+        if logfile:
+            if len(buffer) > 1 and buffer[-1] != '\n':
+                logfile.write('\n')
+
         return buffer
 
     def eval_expression(self, expression, logfile=None):
@@ -754,21 +775,28 @@ class Trace32API:
         the result to a logfile as its received. """
 
         msgline_flag = self.clear_area()
-        result = self.T32_ExecuteFunction(expression)
+        result = self.api.T32_ExecuteFunction(expression)
 
-        message_string = self.T32_GetMessageString()
+        message_string = self.api.T32_GetMessageString()
         if message_string['msg'] != msgline_flag:
             err_types = [MessageType.Error, MessageType.Error_Info]
             if [x for x in message_string['types'] if x in err_types]:
                 raise EvalError(message_string['msg'], expression)
 
+        if logfile:
+            logfile.write(result)
+
+        if len(result) > 1 and result[-1] != '\n':
+            logfile.write('\n')
+
         return result
 
+
 def _main():
-    api = Trace32API()
-    api.connect(port=30000)
-    api.T32_Ping()
-    api.disconnect()
+    iface = Trace32Interface()
+    iface.connect(port=30000)
+    iface.ping()
+    iface.disconnect()
     print("Connection test OK.")
 
 
