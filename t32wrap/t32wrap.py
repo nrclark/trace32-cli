@@ -41,18 +41,18 @@ def run_parser(parser):
 
 
 def main():
-    t32_runner = Trace32Subprocess("t32marm")
-    t32_runner.run()
-
     parser = create_parser()
     args = run_parser(parser)
 
-    def connect(self, node="localhost", port=20000, packlen=None):
-
-
     api = Trace32API()
 
+    with Trace32Subprocess("t32marm") as t32proc:
+        api.connect(port=t32proc.port)
+        print("connected OK")
+
+        api.disconnect(quit=True)
+        print("disconnected OK")
     print(args)
 
 if __name__ == "__main__":
-    main()
+    main()#
