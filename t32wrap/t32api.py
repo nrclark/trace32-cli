@@ -7,9 +7,6 @@ time of this writing). """
 
 import ctypes
 import enum
-import sys
-import atexit
-import signal
 import os
 import re
 import time
@@ -485,7 +482,7 @@ class Trace32API:
 
         self.dll.T32_Break()
 
-    def connect(self, node="localhost", port=20000, packlen=None):
+    def connect(self, node="localhost", port=20000, packlen=None, timeout=10):
         """ Connect to a Trace32 instance. """
 
         self.T32_Config("NODE=", node)
@@ -494,8 +491,22 @@ class Trace32API:
         if packlen:
             self.dll.T32_Config("PACKLEN=", packlen)
 
-        self.T32_Init()
-        register_cleanup(self.disconnect)
+        init_ok = False
+        maxtime = time.time() + timeout
+
+        while time.time() < maxtime:
+            try:
+                self.T32_Init()
+                init_ok = True
+                break
+            except CommunicationError as err:
+                last_exception = err
+                time.sleep(0.01)
+
+        if not init_ok:
+            raise last_exception
+
+        register_cleanup(self.T32_Exit)
 
         self.T32_Attach()
         self.T32_Ping()
@@ -517,7 +528,7 @@ class Trace32API:
 
         self.connected = True
 
-    def disconnect(self):
+    def disconnect(self, quit = False):
         """ Disconnect from a Trace32 instance. """
 
         if not self.connected:
@@ -528,9 +539,11 @@ class Trace32API:
             f"AREA.Delete {self.area}",
         ]
 
+        if quit:
+            cmds.append("QUIT")
+
         for cmd in cmds:
             self.T32_Cmd(cmd)
-
         self.T32_Exit()
         self.connected = False
 
@@ -611,15 +624,12 @@ class Trace32API:
             pass
 
         message_string = self.T32_GetMessageString()
-        try:
-            if message_string['msg'] != init_message:
-                buffer += "\n" + message_string['msg']
-                err_types = [MessageType.Error, MessageType.Error_Info]
-                if [x for x in message_string['types'] if x in err_types]:
-                    raise ScriptFailure(script, message_string)
-        except TypeError:
-            import ipdb
-            ipdb.set_trace()
+        if message_string['msg'] != init_message:
+            buffer += "\n" + message_string['msg']
+            err_types = [MessageType.Error, MessageType.Error_Info]
+            if [x for x in message_string['types'] if x in err_types]:
+                raise ScriptFailure(script, message_string)
+
         return buffer
 
     def run_script(self, script, logfile=None):
@@ -646,22 +656,8 @@ def _main():
     api.connect(port=30000)
     api.T32_Ping()
     api.disconnect()
-
     print("Connection test OK.")
 
 
-def dummy_main():
-    script = "/home/nick.clark/work/dune-haps-firmware/tools/dunehaps_linux_boot.cmm"
-    api = Trace32API()
-    api.connect(port=30000)
-    result = api.run_scriptfile(script, logfile=sys.stdout)
-    print(repr(result))
-
-    #import ipdb
-    #ipdb.set_trace()
-
-    api.disconnect()
-
-
 if __name__ == "__main__":
-    dummy_main()
+    _main()

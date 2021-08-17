@@ -16,7 +16,7 @@ import glob
 import time
 import threading
 
-from .common import make_tempdir
+from .common import make_tempdir, register_cleanup
 
 # --------------------------------------------------------------------------- #
 
@@ -178,7 +178,7 @@ class Trace32Subprocess:
     # pylint: disable=too-many-instance-attributes
 
     def __init__(self, trace32_bin, podbus: Podbus = Podbus.SIM, gui=False):
-        self.port, self.dummy_socket = self._get_port()
+        self.port, self._dummy_socket = self._get_port()
         self.t32dir = self._find_trace32_dir(trace32_bin)
         self.t32bin = self._find_program(trace32_bin, self.t32dir)
 
@@ -186,11 +186,17 @@ class Trace32Subprocess:
         self.tempdir = self._tempdir_obj.name
 
         self.config_file = os.path.join(self.tempdir, "trace32.cfg")
-        self.returncode = None
-        self._stop_request = False
+        self.popen = None
 
         with open(self.config_file, "w") as outfile:
             outfile.write(self._genconfig(gui, podbus))
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exception_type, exception_val, trace):
+        self.stop()
 
     @staticmethod
     def _get_port(port: typing.Optional[int] = None):
@@ -349,21 +355,44 @@ class Trace32Subprocess:
 
     def stop(self):
         """ Shuts down trace32 by sending SIGTERM to the subprocess, followed
-        by SIGKILL if it didn't respond to SIGTERM. """
-        self._stop_request = True
+        by SIGKILL if it didn't respond to SIGTERM within 2 seconds. """
 
-    def run(self, pollrate=0.05):
+        if self.popen is None:
+            return -1
+
+        if self.popen.returncode is not None:
+            return self.popen.returncode
+
+        self.popen.terminate()
+
+        timeout = time.time() + 5
+        while time.time() < timeout:
+            self.popen.poll()
+            if self.popen.returncode is not None:
+                return self.popen.returncode
+            time.sleep(0.01)
+
+        self.popen.kill()
+        progname = os.path.basename(self.t32bin)
+        sys.stderr.write(f"Issued SIGKILL to {progname}.\n")
+
+        timeout = time.time() + 5
+        while time.time() < timeout:
+            self.popen.poll()
+            if self.popen.returncode is not None:
+                return self.popen.returncode
+            time.sleep(0.01)
+
+        sys.stderr.write(f"Fatal: failed to halt {progname}.\n")
+        return -1
+
+    def start(self):
         """ Runs {self.t32bin} as a subprocess with pipe-connected stdin,
-        stdout, and stderr attached to thread-serviced queues. Uses a polling
-        loop to wait for the subprocess to finish, and returns the errcode.
-
-        can be accessed with self.stdin(), self.stdout(), and self.stderr()
-        respectively. Can be signalled to terminate by self.stop(). This
-        function is suitable for running in a background thread to support
-        cross-platform nonblocking I/O. """
+        stdout, and stderr attached to thread-serviced queues, and returns the
+        active popen instance. I/O can be accessed with popen.write_stdin(),
+        popen.read_stdout(), and popen.read_stderr() respectively."""
 
         cmd = [self.t32bin, "-c", self.config_file]
-        timeout = 0
 
         if 'CREATE_NEW_PROCESS_GROUP' in dir(sp):
             flag = sp.__dict__['CREATE_NEW_PROCESS_GROUP']
@@ -371,28 +400,6 @@ class Trace32Subprocess:
         else:
             extra_arg = {"start_new_session": True}
 
-        self.dummy_socket.close()
-        popen = ThreadedPopen(cmd, bufsize=0, stdin=sp.PIPE, stdout=sp.PIPE,
-                              stderr=sp.PIPE, **extra_arg)
-
-        timeout = None
-
-        while True:
-            if self._stop_request:
-                popen.terminate()
-                timeout = time.time() + 2
-
-            if timeout and (time.time() > timeout):
-                timeout = None
-                popen.kill()
-                progname = os.path.basename(self.t32bin)
-                sys.stderr.write(f"Issued SIGKILL to {progname}.\n")
-
-            try:
-                popen.wait(timeout=pollrate)
-            except sp.TimeoutExpired:
-                pass
-
-            if popen.poll() is not None:
-                self.returncode = popen.returncode
-                return popen.returncode
+        self._dummy_socket.close()
+        self.popen = ThreadedPopen(cmd, **extra_arg)
+        register_cleanup(self.popen.kill)

@@ -25,6 +25,7 @@ def make_tempdir():
     tempdir in a subdirectory of $TMPDIR, $TMP, $TEMP, or $XDG_RUNTIME_DIR
     if any of those environment variables are set. Otherwise, Python's default
     location is used for tempfile.TemporaryDirectory(). """
+    # pylint: disable=consider-using-with
 
     for varname in ["TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"]:
         if varname in os.environ and os.path.isdir(os.environ[varname]):
