@@ -63,7 +63,7 @@ def until_keyword(file_obj, keyword, maxblock=None, poll_rate=None):
 # --------------------------------------------------------------------------- #
 
 
-class FunctionFailure(Exception):
+class ApiError(Exception):
     """ Base exception class used to report failed Trace32 API calls. """
 
     def __init__(self, funcname, errcode):
@@ -91,15 +91,27 @@ class FunctionFailure(Exception):
         return err_msg
 
 
-class CommunicationError(FunctionFailure):
+class CommunicationError(ApiError):
     """ Exception class used to report Trace32 API calls that failed
     because of communication errors between this library and the remote
     Trace32 instance. """
 
 
-class CommandFailure(FunctionFailure):
+class CallFailure(ApiError):
     """ Exception class used to report Trace32 API calls that were sent
     successfully, but returned an error from the remote Trace32 instance. """
+
+class CommandFailure(Exception):
+    """ Exception class used to report that a PRACTICE command failed. Contains
+    the failing command, and also some data about the error. """
+
+    def __init__(self, command, error):
+        super().__init__()
+        self.command = command
+        self.error = error
+
+    def __str__(self):
+        return self.error
 
 class ScriptFailure(Exception):
     """ Exception class used to report that a PRACTICE script failed. Contains
@@ -112,6 +124,45 @@ class ScriptFailure(Exception):
 
     def __str__(self):
         return repr(self.error)
+
+
+class EvalError(Exception):
+    """ Base exception class used to report failed Trace32 API calls. """
+
+    def __init__(self, reason=None, expression=None):
+        super().__init__()
+        self.expression = expression
+        self.reason = reason
+        self.name = re.search("'.*'", str(self.__class__)).group(0)[1:-1]
+
+    @staticmethod
+    def _shorten(phrase):
+        if phrase is None:
+            return "None"
+        clip = phrase[:32]
+        if clip != phrase:
+            clip += "..."
+        return clip
+
+    def __str__(self):
+        expression = self._shorten(self.expression)
+
+        if self.reason and self.expression:
+            return f"[{expression}] ({self.reason})"
+
+        if self.reason:
+            return f"{self.reason}"
+
+        if self.expression:
+            return f"{expression}"
+
+        return self.name
+
+    def __repr__(self):
+        result = self._shorten(self.reason)
+        expression = self._shorten(self.expression)
+        return f"{self.name}({result}, {expression})"
+
 
 class AttachType(enum.IntEnum):
     """ Device-types understood by T32_Attach. Note that ICE is an alias for
@@ -215,7 +266,7 @@ def confirm_success(result, func, args=None):
         arg_strings.append(arg)
 
     arg_str = "(%s)" % ", ".join(arg_strings)
-    raise CommandFailure(func.__name__ + arg_str, errcode)
+    raise CallFailure(func.__name__ + arg_str, errcode)
 
 
 # --------------------------------------------------------------------------- #
@@ -402,7 +453,7 @@ class Trace32API:
         if buffer[msg_len - 1:msg_len] == b'\x00':
             msg_len -= 1
 
-        #pylint: disable=consider-using-generator
+        # pylint: disable=consider-using-generator
         types = tuple([x for x in MessageType if int(x.value) & msg_type])
         msg = buffer.value.decode("ascii")
         return {"msg": msg, "types": types}
@@ -431,7 +482,7 @@ class Trace32API:
         self.dll.T32_GetPracticeState(pstate)
 
         if pstate.value == -1:
-            raise CommandFailure("T32_GetPracticeState.pstate", pstate)
+            raise CallFailure("T32_GetPracticeState.pstate", pstate)
 
         return PracticeState(pstate.value)
 
@@ -447,24 +498,44 @@ class Trace32API:
         other kinds of commands will block until they're completed. """
 
         buffer = ctypes.create_string_buffer(2**16)
-        self.dll.T32_ExecuteCommand(cmd, buffer, 2**16 - 1)
+        call_failure = None
+
+        try:
+            self.dll.T32_ExecuteCommand(cmd, buffer, 2**16 - 1)
+        except CallFailure as err:
+            call_failure = err
+
+        if call_failure:
+            if call_failure.errcode != Errcode.T32_ERR_EXECUTECOMMAND_FAIL:
+                raise call_failure
+
+            raise CommandFailure(cmd, buffer.value.decode("ascii"))
+
         return buffer.value.decode("ascii")
 
     def T32_ExecuteFunction(self, expression):
         """ Evaluate a TRACE32 expression/command. Return the resulting
         buffer, as well as its reported result-type. """
 
-        buffer = ctypes.create_string_buffer(2**16)
+        buff = ctypes.create_string_buffer(2**16)
         restype = ctypes.c_uint32(0)
-        self.dll.T32_ExecuteFunction(expression, buffer, 2**16 - 1, restype)
+        error = False
+        try:
+            self.dll.T32_ExecuteFunction(expression, buff, 2**16 - 1, restype)
+        except CallFailure:
+            error = True
+
+        if error:
+            result = buff.value.decode('latin-1')
+            raise EvalError(result, expression)
 
         if restype.value not in (x.value for x in ResultType):
             err_msg = f"result-type [{restype}] from T32_ExecuteFunction"
             err_msg += " is unknown."
             raise ValueError(err_msg)
 
-        buffer = buffer.value.decode("ascii")
-        return {"msg": buffer, "type": ResultType(restype.value)}
+        buff = buff.value.decode("ascii")
+        return {"msg": buff, "type": ResultType(restype.value)}
 
     def T32_Stop(self):
         """ Stop a currently-running PRACTICE script. """
@@ -528,7 +599,7 @@ class Trace32API:
 
         self.connected = True
 
-    def disconnect(self, quit = False):
+    def disconnect(self, shutdown=False):
         """ Disconnect from a Trace32 instance. """
 
         if not self.connected:
@@ -539,11 +610,12 @@ class Trace32API:
             f"AREA.Delete {self.area}",
         ]
 
-        if quit:
+        if shutdown:
             cmds.append("QUIT")
 
         for cmd in cmds:
             self.T32_Cmd(cmd)
+
         self.T32_Exit()
         self.connected = False
 
@@ -560,22 +632,10 @@ class Trace32API:
         assert isinstance(data, bytes)
         self.dll.write_memory(address, address_width, data, len(data))
 
-    def run_scriptfile(self, scriptfile, logfile=None):
-        """ Run a PRACTICE script that exists on the filesystem. """
-
-        buffer = ""
-        script = open(scriptfile).read()
-        lines = re.sub("^[ \t]*;.*?$", "", script.strip(), flags=re.M).splitlines()
-        lines = [x.strip() for x in lines]
-        lines = [x for x in lines if x]
-
-        if not lines[-1].startswith("ENDDO"):
-            err_msg = "Error: %s is missing final ENDDO statement."
-            raise ValueError(err_msg % scriptfile)
-
-        # A shared Trace32 AREA is used to capture the script's output. Before
-        # running ther script, the AREA is cleared and selected, and and any
-        # pending FIFO data is dropped.
+    def clear_area(self):
+        """ Clears the current AREA, and drops any data pending in the input
+        FIFO (which is connected to that AREA). Set the message-string to
+        a detectable flag-value, and return that value. """
 
         self.T32_Cmd(f"AREA.CLEAR {self.area}")
         self.T32_Cmd(f"AREA.Select {self.area}")
@@ -583,11 +643,26 @@ class Trace32API:
             pass
 
         chars = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(16)]
-        init_message = f"Semaphore {''.join(chars)}"
-        self.T32_Cmd(f'Print %AREA A000 "{init_message}"')
+        flag_message = f"Semaphore {''.join(chars)}"
+        self.T32_Cmd(f'Print %AREA A000 "{flag_message}"')
         message_string = self.T32_GetMessageString()
-        assert message_string['msg'] == init_message
+        assert message_string['msg'] == flag_message
+        return flag_message
 
+    def run_scriptfile(self, scriptfile, logfile=None):
+        """ Run a PRACTICE script that exists on the filesystem. """
+
+        buffer = ""
+        script = open(scriptfile).read().strip()
+        lines = re.sub("^[ \t]*;.*?$", "", script, flags=re.M).splitlines()
+        lines = [x.strip() for x in lines]
+        lines = [x for x in lines if x]
+
+        if not lines[-1].startswith("ENDDO"):
+            err_msg = "Error: %s is missing final ENDDO statement."
+            raise ValueError(err_msg % scriptfile)
+
+        msgline_flag = self.clear_area()
         self.T32_ExecuteCommand(f"DO {os.path.abspath(scriptfile)}")
 
         try:
@@ -624,7 +699,7 @@ class Trace32API:
             pass
 
         message_string = self.T32_GetMessageString()
-        if message_string['msg'] != init_message:
+        if message_string['msg'] != msgline_flag:
             buffer += "\n" + message_string['msg']
             err_types = [MessageType.Error, MessageType.Error_Info]
             if [x for x in message_string['types'] if x in err_types]:
@@ -650,6 +725,44 @@ class Trace32API:
 
         return result
 
+    def run_command(self, cmd, logfile=None):
+        """ Run a single command and return the result. Optionally, also write
+        the result to a logfile as its received. """
+
+        self.clear_area()
+
+        self.T32_ExecuteCommand(cmd)
+        flag = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(16)]
+        flag = "".join(flag)
+        self.T32_Cmd(f'PRINT %AREA {self.area} "{flag}"')
+
+        fetcher = until_keyword(self.fifo, flag, maxblock=4096, poll_rate=0.05)
+        buffer = ""
+        for chunk in fetcher:
+            if logfile:
+                logfile.write(chunk)
+
+            buffer += chunk
+
+        while self.fifo.read(4096):
+            pass
+
+        return buffer
+
+    def eval_expression(self, expression, logfile=None):
+        """ Run a single command and return the result. Optionally, also write
+        the result to a logfile as its received. """
+
+        msgline_flag = self.clear_area()
+        result = self.T32_ExecuteFunction(expression)
+
+        message_string = self.T32_GetMessageString()
+        if message_string['msg'] != msgline_flag:
+            err_types = [MessageType.Error, MessageType.Error_Info]
+            if [x for x in message_string['types'] if x in err_types]:
+                raise EvalError(message_string['msg'], expression)
+
+        return result
 
 def _main():
     api = Trace32API()
