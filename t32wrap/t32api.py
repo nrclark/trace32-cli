@@ -536,8 +536,14 @@ class Trace32API:
 
 
 class Trace32Interface:
-    """ Ctypes-based wrapper around useful Trace32 CAPI functions. Adds some
-    argument management, standardized error-checking, etc. """
+    """ High-level Trace32 interface that provides better-integrated functions
+    for running commands and/or scripts, and evaluating literals. The interface
+    uses a FIFO on the filesystem to pipe data out from a newly-created AREA.
+
+    The routines in this class wrap a lot of the oddness/non-standard error
+    handling that's necessary to automate error detection. Trace32 reports
+    errors in a few different ways, all generally quite obnoxious."""
+
     # pylint: disable=invalid-name
 
     def __init__(self, libfile=None):
@@ -597,8 +603,15 @@ class Trace32Interface:
         name = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(8)]
         self.area = ''.join(name)
 
+        # The geometry of this window was experimentally determined by hunting
+        # around. Trace32 doesn't let you make an infinite-sized window, but
+        # also doesn't clearly state where the limits are. Experimentally,
+        # the limit is a 4095x32767-sized window. We don't need to buffer that
+        # many lines though, since we're configuring the AREA to pipe directly
+        # out to a FIFO.
+
         cmds = [
-            f"AREA.Create {self.area} 4095. 64.",
+            f"AREA.Create {self.area} 4095. 1024.",
             f"AREA.OPEN {self.area} {self.fifo_name} /Append /NoFileCache",
             f"AREA.Select {self.area}"
         ]
@@ -784,10 +797,10 @@ class Trace32Interface:
                 raise EvalError(message_string['msg'], expression)
 
         if logfile:
-            logfile.write(result)
+            logfile.write(result['msg'])
 
-        if len(result) > 1 and result[-1] != '\n':
-            logfile.write('\n')
+            if len(result['msg']) > 1 and result['msg'][-1] != '\n':
+                logfile.write('\n')
 
         return result
 
