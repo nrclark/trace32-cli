@@ -15,8 +15,10 @@ import platform
 import glob
 import time
 import threading
+import multiprocessing as mp
 
 from .common import make_tempdir, register_cleanup
+from .t32api import Trace32API
 
 # --------------------------------------------------------------------------- #
 
@@ -174,10 +176,14 @@ class Podbus(enum.Enum):
 
 class Trace32Subprocess:
     """ Class for running Trace32 in a subprocess, and communicating with its
-    stdin/stdout/stderr via queues. """
+    stdin/stdout/stderr via queues. This class can be used as a 'with'
+    context-manager if you want it to attempt an API-based request for Trace32
+    to quite gracefully. """
+
     # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, trace32_bin, podbus: Podbus = Podbus.SIM, gui=False):
+    def __init__(self, trace32_bin, podbus: Podbus = Podbus.SIM, gui=False,
+                 libfile=None):
         self.port, self._dummy_socket = self._get_port()
         self.t32dir = self._find_trace32_dir(trace32_bin)
         self.t32bin = self._find_program(trace32_bin, self.t32dir)
@@ -187,16 +193,60 @@ class Trace32Subprocess:
 
         self.config_file = os.path.join(self.tempdir, "trace32.cfg")
         self.popen = None
+        self.podbus = podbus
+        self.libfile = libfile
 
         with open(self.config_file, "w") as outfile:
             outfile.write(self._genconfig(gui, podbus))
+
+    @staticmethod
+    def _api_quit(libfile, port):
+        api = Trace32API(libfile)
+        api.T32_Config("NODE=", "localhost")
+        api.T32_Config("PORT=", port)
+        api.T32_Init()
+        api.T32_Terminate(1)
+        api.T32_Exit()
 
     def __enter__(self):
         self.start()
         return self
 
     def __exit__(self, exception_type, exception_val, trace):
-        self.stop()
+        if self.popen is None:
+            return
+
+        if self.popen.poll() is not None:
+            return
+
+        if exception_type in (None, KeyboardInterrupt):
+            args = (self.libfile, self.port)
+            proc = mp.Process(target=self._api_quit, args=args, daemon=True)
+            proc.start()
+            timeout = time.time() + 1
+
+            while proc.is_alive():
+                time.sleep(0.01)
+                if time.time() > timeout:
+                    break
+
+        if proc.exitcode == 0:
+            timeout = 10
+
+        elif proc.exitcode is None:
+            proc.terminate()
+            timeout = 0.25
+
+        timeout = time.time() + timeout
+        while True:
+            if self.popen.poll() is not None:
+                return
+
+            time.sleep(0.01)
+            if time.time() > timeout:
+                break
+
+        self.stop(0.25)
 
     @staticmethod
     def _get_port(port: typing.Optional[int] = None):
@@ -353,9 +403,11 @@ class Trace32Subprocess:
 
         return matches[0]
 
-    def stop(self):
+    def stop(self, wait_kill=5):
         """ Shuts down trace32 by sending SIGTERM to the subprocess, followed
         by SIGKILL if it didn't respond to SIGTERM within 2 seconds. """
+
+        progname = os.path.basename(self.t32bin)
 
         if self.popen is None:
             return -1
@@ -363,9 +415,14 @@ class Trace32Subprocess:
         if self.popen.returncode is not None:
             return self.popen.returncode
 
-        self.popen.terminate()
+        sys.stderr.write(f"Aborting {progname}.\n")
+        if self.podbus == Podbus.USB:
+            msg = "Please reset the Trace32 USB debugger afterwards.\n"
+            sys.stderr.write(msg)
 
-        timeout = time.time() + 5
+        self.popen.terminate()
+        timeout = time.time() + wait_kill
+
         while time.time() < timeout:
             self.popen.poll()
             if self.popen.returncode is not None:
@@ -373,10 +430,10 @@ class Trace32Subprocess:
             time.sleep(0.01)
 
         self.popen.kill()
-        progname = os.path.basename(self.t32bin)
+
         sys.stderr.write(f"Issued SIGKILL to {progname}.\n")
 
-        timeout = time.time() + 5
+        timeout = time.time() + wait_kill
         while time.time() < timeout:
             self.popen.poll()
             if self.popen.returncode is not None:
