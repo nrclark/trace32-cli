@@ -13,6 +13,7 @@ import time
 import tempfile
 import random
 import multiprocessing as mp
+import re
 
 from .t32api_errors import Errcode
 from .common import register_cleanup, make_tempdir
@@ -675,16 +676,36 @@ class Trace32Interface:
         """ Checks to make sure that the API is connected and active. """
         self.api.T32_Ping()
 
-    def read_memory(self, address, length, address_width=64):
+    def read_memory(self, address, length, address_width=None):
         """ Reads a block of data from the target's memory-space and
-        returns it. """
+        returns it. Set address_width to 32 or 64 for an explicit value,
+        or else it'll be auto-determined. """
+
+        if address_width is None:
+            if address >= 2**32:
+                address_width = 64
+            #elif self.eval_expression("CPUIS64BIT()"):
+            #    address_width = 64
+            else:
+                address_width = 32
 
         buffer = ctypes.create_string_buffer(length)
         self.api.dll.read_memory(address, address_width, buffer, length)
         return buffer.raw
 
-    def write_memory(self, address, data, address_width=64):
-        """ Writes a block of data to the target's memory-space. """
+    def write_memory(self, address, data, address_width=None):
+        """ Writes a block of data to the target's memory-space. Set
+        address_width to 32 or 64 for an explicit value, or else it'll be
+        auto-determined. """
+
+        if address_width is None:
+            if address >= 2**32:
+                address_width = 64
+            #elif self.eval_expression("CPUIS64BIT()"):
+            #    address_width = 64
+            else:
+                address_width = 32
+
         assert isinstance(data, bytes)
         self.api.dll.write_memory(address, address_width, data, len(data))
 
@@ -874,7 +895,7 @@ class Trace32Interface:
 
         return buffer
 
-    def eval_expression(self, expression, logfile=None):
+    def eval_expression(self, expression, decode=True, logfile=None):
         """ Run a single command and return the result. Optionally, also write
         the result to a logfile as its received. """
 
@@ -893,7 +914,35 @@ class Trace32Interface:
             if len(result['msg']) > 1 and result['msg'][-1] != '\n':
                 logfile.write('\n')
 
-        return result
+        if not decode:
+            return result
+
+        if result['type'] == ResultType.Boolean:
+            if result['msg'].lower() in ["true", "true()", "1"]:
+                return True
+
+            if result['msg'].lower() in ["false", "false()", "0"]:
+                return False
+
+            err_msg = f"Unknown mapping from [{result['msg']}] to bool."
+            raise ValueError(err_msg)
+
+        elif result['type'] == ResultType.Hexadecimal:
+            return int(result['msg'], 16)
+
+        elif result['type'] == ResultType.Binary:
+            msg = re.sub("[!]$", "", result['msg'])
+            msg = re.sub("^(0y){0,1}", "0b", msg)
+            return int(msg, 2)
+
+        elif result['type'] == (ResultType.Decimal):
+            msg = re.sub("[.]$", "", result['msg'])
+            return int(msg, 10)
+
+        elif result['type'] == (ResultType.Float):
+            return float(result['msg'])
+
+        return result['msg']
 
 
 def _main():
