@@ -16,19 +16,107 @@ import glob
 import time
 import threading
 import multiprocessing as mp
+import re
 
 from .common import make_tempdir, register_cleanup
-from .t32api import Trace32API
+from .t32api import Trace32API, CommunicationError
 
 # --------------------------------------------------------------------------- #
 
 
-def add_doc(value):
+def _add_doc(value):
     """ Decorator that adds a docstring to a function. """
     def _doc(func):
         func.__doc__ = value
         return func
     return _doc
+
+
+def find_trace32_dir(trace32_bin=None):
+    """ Finds the install directory for Trace32. Checks to see if 'trace32_bin'
+    is in the system PATH, and derives the install directory from that if
+    possible. Otherwise, $HOME/t32 and /opt/t32 are checked in that order. """
+
+    if trace32_bin:
+        trace32_executable = shutil.which(trace32_bin)
+
+        if trace32_executable is not None:
+            dirname = os.path.abspath(os.path.dirname(trace32_executable))
+
+            while dirname != "/":
+                if os.path.exists(os.path.join(dirname, "version.t32")):
+                    if os.path.exists(os.path.join(dirname, "bin")):
+                        return os.path.abspath(dirname)
+
+                dirname = os.path.abspath(os.path.join(dirname, ".."))
+
+    sysdir_choices = [os.path.join(os.path.expanduser("~"), "t32")]
+
+    if "windows" in platform.system().lower():
+        sysdir_choices.append("C:\\T32")
+        sysdir_choices.append("C:\\t32")
+    else:
+        sysdir_choices.append("/opt/t32")
+        sysdir_choices.append("/usr/local/t32")
+
+    for dirname in sysdir_choices:
+        if os.path.exists(os.path.join(dirname, "version.t32")):
+            return os.path.abspath(dirname)
+
+    raise ValueError("Couldn't find Trace32 install directory.")
+
+
+def find_trace32_bin(target, install_dir):
+    """ Finds the right trace32 executable for your target bin. If pointed
+    at a multi-OS install, the right OS is chosen based on the Python
+    interpeter being used. Tries an exact match, but can also pick up -qt
+    variants if an exact match isn't found. """
+
+    platname = platform.system().lower()
+    if "windows" in platname and target.endswith(".exe"):
+        target = target[:-4]
+
+    glob_frag = f"bin/*/{target}*".replace("/", os.sep)
+    glob_pattern = os.path.join(os.path.abspath(install_dir), glob_frag)
+    matches = glob.glob(glob_pattern)
+    match_dirs = [os.path.basename(os.path.dirname(x)) for x in matches]
+    bin_platforms = sorted(set(match_dirs))
+
+    if "darwin" in platname:
+        bin_platforms = [x for x in bin_platforms if "mac" in x]
+    elif "windows" in platname:
+        bin_platforms = [x for x in bin_platforms if "windows" in x]
+    elif "linux" in platname:
+        bin_platforms = [x for x in bin_platforms if "linux" in x]
+    elif "solaris" in platname:
+        bin_platforms = [x for x in bin_platforms if "suns" in x]
+
+    if "64" in str(platform.architecture()[0]):
+        bin_platforms = [x for x in bin_platforms if "64" in x]
+    else:
+        bin_platforms = [x for x in bin_platforms if "64" not in x]
+
+    if len(bin_platforms) != 1:
+        msg = f"Couldn't find a compatible installation in {install_dir}."
+        raise OSError(msg)
+
+    bindir = os.path.join(install_dir, "bin", bin_platforms[0])
+    glob_pattern = os.path.join(bindir, f"{target}*")
+
+    if "windows" in platname:
+        glob_pattern += ".exe"
+
+    matches = glob.glob(glob_pattern)
+    matches = sorted([x for x in matches if shutil.which(x)])
+    if not matches:
+        msg = f"Couldn't find executable with name {target} in {bindir}."
+        raise OSError(msg)
+
+    for match in matches:
+        if os.path.splitext(os.path.basename(match))[0] == target:
+            return match
+
+    return matches[0]
 
 
 class ThreadedPopen(sp.Popen):
@@ -77,23 +165,23 @@ class ThreadedPopen(sp.Popen):
                 pipe.close()
             self._shutdown = True
 
-    @add_doc(sp.Popen.terminate.__doc__)
+    @_add_doc(sp.Popen.terminate.__doc__)
     def terminate(self, *args, **kwargs):
         super().terminate(*args, **kwargs)
         self._shutdown_pipes()
 
-    @add_doc(sp.Popen.kill.__doc__)
+    @_add_doc(sp.Popen.kill.__doc__)
     def kill(self, *args, **kwargs):
         super().kill(*args, **kwargs)
         self._shutdown_pipes()
 
-    @add_doc(sp.Popen.wait.__doc__)
+    @_add_doc(sp.Popen.wait.__doc__)
     def wait(self, timeout=None):
         result = super().wait(timeout=timeout)
         self._shutdown_pipes()
         return result
 
-    @add_doc(sp.Popen.communicate.__doc__)
+    @_add_doc(sp.Popen.communicate.__doc__)
     def communicate(self, input=None, timeout=None):
         # pylint: disable=redefined-builtin
         if input:
@@ -102,7 +190,7 @@ class ThreadedPopen(sp.Popen):
         self._shutdown_pipes()
         return result
 
-    @add_doc(sp.Popen.poll.__doc__)
+    @_add_doc(sp.Popen.poll.__doc__)
     def poll(self):
         result = super().poll()
         if result is not None:
@@ -116,8 +204,8 @@ class ThreadedPopen(sp.Popen):
                 try:
                     data = iopipe.read(2**16)
                     ioqueue.put(data)
-                # pylint: disable=bare-except
-                except:
+                # pylint: disable=broad-except
+                except Exception:
                     break
 
         elif direction == "write":
@@ -126,8 +214,8 @@ class ThreadedPopen(sp.Popen):
                     data = ioqueue.get()
                     ioqueue.task_done()
                     iopipe.write(data)
-                # pylint: disable=bare-except
-                except:
+                # pylint: disable=broad-except
+                except Exception:
                     break
 
     def _read_queue(self, ioqueue):
@@ -185,8 +273,8 @@ class Trace32Subprocess:
     def __init__(self, trace32_bin, podbus: Podbus = Podbus.SIM, gui=False,
                  libfile=None):
         self.port, self._dummy_socket = self._get_port()
-        self.t32dir = self._find_trace32_dir(trace32_bin)
-        self.t32bin = self._find_program(trace32_bin, self.t32dir)
+        self.t32dir = find_trace32_dir(trace32_bin)
+        self.t32bin = find_trace32_bin(trace32_bin, self.t32dir)
 
         self._tempdir_obj = make_tempdir()
         self.tempdir = self._tempdir_obj.name
@@ -220,6 +308,12 @@ class Trace32Subprocess:
             return
 
         if exception_type in (None, KeyboardInterrupt):
+            graceful_exit = 1
+
+        elif exception_type not in (CommunicationError,):
+            graceful_exit = 1
+
+        if graceful_exit:
             args = (self.libfile, self.port)
             proc = mp.Process(target=self._api_quit, args=args, daemon=True)
             proc.start()
@@ -230,21 +324,21 @@ class Trace32Subprocess:
                 if time.time() > timeout:
                     break
 
-        if proc.exitcode == 0:
-            timeout = 10
+            if proc.exitcode == 0:
+                timeout = 10
 
-        elif proc.exitcode is None:
-            proc.terminate()
-            timeout = 0.25
+            elif proc.exitcode is None:
+                proc.terminate()
+                timeout = 0.25
 
-        timeout = time.time() + timeout
-        while True:
-            if self.popen.poll() is not None:
-                return
+            timeout = time.time() + timeout
+            while True:
+                if self.popen.poll() is not None:
+                    return
 
-            time.sleep(0.01)
-            if time.time() > timeout:
-                break
+                time.sleep(0.01)
+                if time.time() > timeout:
+                    break
 
         self.stop(0.25)
 
@@ -272,41 +366,6 @@ class Trace32Subprocess:
         temp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         port = int(temp_socket.getsockname()[1])
         return (port, temp_socket)
-
-    @staticmethod
-    def _find_trace32_dir(trace32_bin=None):
-        """ Finds the install directory for Trace32. Checks to see if
-        'trace32_bin' is in the system PATH, and derives the install directory
-        from that if possible. Otherwise, $HOME/t32 and /opt/t32 are checked
-        in that order. """
-
-        if trace32_bin:
-            trace32_executable = shutil.which(trace32_bin)
-
-            if trace32_executable is not None:
-                dirname = os.path.abspath(os.path.dirname(trace32_executable))
-
-                while dirname != "/":
-                    if os.path.exists(os.path.join(dirname, "version.t32")):
-                        if os.path.exists(os.path.join(dirname, "bin")):
-                            return os.path.abspath(dirname)
-
-                    dirname = os.path.abspath(os.path.join(dirname, ".."))
-
-        sysdir_choices = [os.path.join(os.path.expanduser("~"), "t32")]
-
-        if "windows" in platform.system().lower():
-            sysdir_choices.append("C:\\T32")
-            sysdir_choices.append("C:\\t32")
-        else:
-            sysdir_choices.append("/opt/t32")
-            sysdir_choices.append("/usr/local/t32")
-
-        for dirname in sysdir_choices:
-            if os.path.exists(os.path.join(dirname, "version.t32")):
-                return os.path.abspath(dirname)
-
-        raise ValueError("Couldn't find Trace32 install directory.")
 
     def _genconfig(self, gui: bool, podbus: Podbus):
         config = """
@@ -349,59 +408,6 @@ class Trace32Subprocess:
             config = config.replace(f"@{key}@", str(replacements[key]))
 
         return config
-
-    @staticmethod
-    def _find_program(target, install_dir):
-        """ Finds the right trace32 executable for your target bin. If pointed
-        at a multi-OS install, the right OS is chosen based on the Python
-        interpeter being used. Tries an exact match, but can also pick up
-        -qt variants if an exact match isn't found. """
-
-        platname = platform.system().lower()
-        if "windows" in platname and target.endswith(".exe"):
-            target = target[:-4]
-
-        glob_frag = f"bin/*/{target}*".replace("/", os.sep)
-        glob_pattern = os.path.join(os.path.abspath(install_dir), glob_frag)
-        matches = glob.glob(glob_pattern)
-        match_dirs = [os.path.basename(os.path.dirname(x)) for x in matches]
-        bin_platforms = sorted(set(match_dirs))
-
-        if "darwin" in platname:
-            bin_platforms = [x for x in bin_platforms if "mac" in x]
-        elif "windows" in platname:
-            bin_platforms = [x for x in bin_platforms if "windows" in x]
-        elif "linux" in platname:
-            bin_platforms = [x for x in bin_platforms if "linux" in x]
-        elif "solaris" in platname:
-            bin_platforms = [x for x in bin_platforms if "suns" in x]
-
-        if "64" in str(platform.architecture()[0]):
-            bin_platforms = [x for x in bin_platforms if "64" in x]
-        else:
-            bin_platforms = [x for x in bin_platforms if "64" not in x]
-
-        if len(bin_platforms) != 1:
-            msg = f"Couldn't find a compatible installation in {install_dir}."
-            raise OSError(msg)
-
-        bindir = os.path.join(install_dir, "bin", bin_platforms[0])
-        glob_pattern = os.path.join(bindir, f"{target}*")
-
-        if "windows" in platname:
-            glob_pattern += ".exe"
-
-        matches = glob.glob(glob_pattern)
-        matches = sorted([x for x in matches if shutil.which(x)])
-        if not matches:
-            msg = f"Couldn't find executable with name {target} in {bindir}."
-            raise OSError(msg)
-
-        for match in matches:
-            if os.path.splitext(os.path.basename(match))[0] == target:
-                return match
-
-        return matches[0]
 
     def stop(self, wait_kill=5):
         """ Shuts down trace32 by sending SIGTERM to the subprocess, followed
@@ -460,3 +466,19 @@ class Trace32Subprocess:
         self._dummy_socket.close()
         self.popen = ThreadedPopen(cmd, **extra_arg)
         register_cleanup(self.popen.kill)
+
+
+def usb_reset():
+    """ Run a Trace32 USB reset using t32usbchecker, which is a utility
+    included in the Trace32 installation. It verifies USB communication
+    with the debug probe, and also resets the probe's internal state.
+
+    This function can be used to recover after force-quitting a Trace32
+    instance and leaving the probe in an unstable state. """
+
+    t32dir = find_trace32_dir()
+    t32bin = find_trace32_bin("t32usbchecker", t32dir)
+    result = sp.run([t32bin], stdout=sp.PIPE, encoding='latin-1', check=True)
+    stdout = re.sub("[ \t\n\r]+", " ", result.stdout.lower())
+    if "USB communication OK".lower() not in stdout:
+        raise IOError("Can't enable USB communication with Trace32")
