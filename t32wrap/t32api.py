@@ -13,7 +13,6 @@ import time
 import tempfile
 import random
 import multiprocessing as mp
-import re
 
 from .t32api_errors import Errcode
 from .common import register_cleanup, make_tempdir
@@ -684,8 +683,6 @@ class Trace32Interface:
         if address_width is None:
             if address >= 2**32:
                 address_width = 64
-            #elif self.eval_expression("CPUIS64BIT()"):
-            #    address_width = 64
             else:
                 address_width = 32
 
@@ -701,8 +698,6 @@ class Trace32Interface:
         if address_width is None:
             if address >= 2**32:
                 address_width = 64
-            #elif self.eval_expression("CPUIS64BIT()"):
-            #    address_width = 64
             else:
                 address_width = 32
 
@@ -895,6 +890,41 @@ class Trace32Interface:
 
         return buffer
 
+    @staticmethod
+    def _decode_eval_result(result):
+        """ Decode the result from a call to T32_ExecuteFunction() into a
+        Python literal. """
+
+        if result['type'] == ResultType.Boolean:
+            if result['msg'].lower() in ["true", "true()", "1"]:
+                return True
+
+            if result['msg'].lower() in ["false", "false()", "0"]:
+                return False
+
+            err_msg = f"Unknown mapping from [{result['msg']}] to bool."
+            raise ValueError(err_msg)
+
+        if result['type'] == ResultType.Hexadecimal:
+            result = int(result['msg'], 16)
+
+        elif result['type'] == ResultType.Binary:
+            msg = re.sub("[!]$", "", result['msg'])
+            msg = re.sub("^(0y){0,1}", "0b", msg)
+            result = int(msg, 2)
+
+        elif result['type'] == (ResultType.Decimal):
+            msg = re.sub("[.]$", "", result['msg'])
+            result = int(msg, 10)
+
+        elif result['type'] == (ResultType.Float):
+            result = float(result['msg'])
+
+        else:
+            result = result['msg']
+
+        return result
+
     def eval_expression(self, expression, decode=True, logfile=None):
         """ Run a single command and return the result. Optionally, also write
         the result to a logfile as its received. """
@@ -917,32 +947,7 @@ class Trace32Interface:
         if not decode:
             return result
 
-        if result['type'] == ResultType.Boolean:
-            if result['msg'].lower() in ["true", "true()", "1"]:
-                return True
-
-            if result['msg'].lower() in ["false", "false()", "0"]:
-                return False
-
-            err_msg = f"Unknown mapping from [{result['msg']}] to bool."
-            raise ValueError(err_msg)
-
-        elif result['type'] == ResultType.Hexadecimal:
-            return int(result['msg'], 16)
-
-        elif result['type'] == ResultType.Binary:
-            msg = re.sub("[!]$", "", result['msg'])
-            msg = re.sub("^(0y){0,1}", "0b", msg)
-            return int(msg, 2)
-
-        elif result['type'] == (ResultType.Decimal):
-            msg = re.sub("[.]$", "", result['msg'])
-            return int(msg, 10)
-
-        elif result['type'] == (ResultType.Float):
-            return float(result['msg'])
-
-        return result['msg']
+        return self._decode_eval_result(result)
 
 
 def _main():
