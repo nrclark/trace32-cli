@@ -1,27 +1,87 @@
 #!/usr/bin/env python3
+"""CLI utility for launching and controlling a Trace32 instance to do useful
+things."""
 
 import argparse
 import sys
 import re
+import os
+import io
 
 from .t32run import usb_reset, Trace32Subprocess
 from .t32run import find_trace32_dir, find_trace32_bin, Podbus
 
 from .t32api import Trace32Interface
 
-# ---------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 
-def read(args):
-    pass
+
+def read(args, iface: Trace32Interface):
+    """ Routine for reading data from the target's memory, and writing to
+    stdout or to an outfile. """
+
+    outfile = None
+    received = 0
+
+    if args.reference:
+        length = os.path.getsize(args.reference)
+    else:
+        length = args.count
+
+    while received < length:
+        chunksize = min(args.blocksize, length - received)
+        block = iface.read_memory(args.address + received, chunksize)
+        assert len(block) == chunksize
+
+        if outfile is None:
+            if args.outfile is None:
+                outfile = sys.stdout.buffer
+            else:
+                # pylint: disable=consider-using-with
+                outfile = open(args.outfile, 'wb')
+
+        outfile.write(block)
+        received += chunksize
+
+    if args.outfile is not None:
+        outfile.close()
+
 
 def write(args):
+    """ Routine for writing data to the target's memory from stdin or an
+    infile. """
+
     pass
 
-def run(args):
-    print(args)
-    pass
 
-# ---------------------------------------------------------------------------- #
+def run(args, iface):
+    """ Routine for running a PRACTICE/TRACE32 command or script. """
+
+    if args.command:
+        cmd = ' '.join(args.statement)
+        iface.run_command(cmd, logfile=args.logdest)
+
+    else:
+        script = args.statement[0]
+        iface.run_file(script, args.statement[1:], logfile=args.logdest)
+
+# --------------------------------------------------------------------------- #
+
+
+def dump_exception(exception, fileobj=sys.stderr):
+    """ Print a compact representation of an Exception (suitable for messages
+    from a CLI tool) to fileobj. If fileobj is None, return the string
+    instead. of printing it."""
+
+    exception_type = str(type(exception))
+    exception_type = exception_type.split()[-1]
+    exception_type = re.sub("[^A-Za-z0-9_.-]", "", exception_type)
+    result = f"Error type: {exception_type}\nError: {str(exception)}"
+    if fileobj is None:
+        return result
+
+    fileobj.write(result + "\n")
+    return None
 
 
 def constant(input_string):
@@ -51,10 +111,10 @@ def constant(input_string):
     mult = 1
     multipliers = {
         'k': 1024,
-        'm': 1024*1024,
-        'g': 1024*1024*1024,
-        't': 1024*1024*1024*1024,
-        'p': 1024*1024*1024*1024*1024
+        'm': 1024 * 1024,
+        'g': 1024 * 1024 * 1024,
+        't': 1024 * 1024 * 1024 * 1024,
+        'p': 1024 * 1024 * 1024 * 1024 * 1024
     }
 
     while True:
@@ -81,7 +141,38 @@ def trace32_binary(input_string):
         return value
     except Exception as err:
         sys.stderr.write(f"{str(err)}\n")
-        raise argparse.ArgumentError(str(err))
+        raise argparse.ArgumentError(None, str(err))
+
+
+def path_readable(filename):
+    """ Confirms that filename is a file that can be opened and read. Raises
+    an ArgumentError otherwise. """
+
+    try:
+        open(filename, 'rb').close()
+    except Exception as err:
+        sys.stderr.write(f"{str(err)}\n")
+        raise argparse.ArgumentError(None, str(err))
+
+    return filename
+
+
+def path_writeable(filename):
+    """ Confirms that filename is a file that can be opened for writing. Raises
+    an ArgumentError otherwise. """
+
+    try:
+        if os.path.exists(filename):
+            open(filename, "r+b").close()
+        else:
+            open(filename, 'w+b').close()
+            os.remove(filename)
+
+    except Exception as err:
+        sys.stderr.write(f"{str(err)}\n")
+        raise argparse.ArgumentError(None, str(err))
+
+    return filename
 
 
 def modify_add_argument(parent):
@@ -89,15 +180,27 @@ def modify_add_argument(parent):
     object to work around a bug in the interaction between argparse.SUPPRESS
     and the "%(default)s" operator. """
 
-    parent._add_argument = parent.add_argument
+    add_argument = parent.add_argument
 
     def make_arg(*args, **kwargs):
-        result = parent._add_argument(*args, **kwargs)
+        result = add_argument(*args, **kwargs)
         if result.default == argparse.SUPPRESS:
             if result.help:
                 result.help = result.help.replace("%(default)s", str(None))
 
     parent.add_argument = make_arg
+
+
+class FlagCount(argparse._CountAction):
+    """ Custom vesion of _CountAction (used by argparse to implement the
+    'count' action) that is cumulative across subparsers. """
+    # pylint: disable=protected-access,too-few-public-methods
+
+    _flag_count = 0
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        FlagCount._flag_count += 1
+        setattr(namespace, self.dest, type(self)._flag_count)
 
 
 def common_options(toplevel=False):
@@ -108,22 +211,24 @@ def common_options(toplevel=False):
     argument_default = None if toplevel else argparse.SUPPRESS
 
     parser = argparse.ArgumentParser(add_help=False,
-                                     argument_default = argument_default)
+                                     argument_default=argument_default)
 
     group = parser.add_argument_group(title="common options")
     modify_add_argument(group)
 
-    group.add_argument("-v", "--verbose", dest="verbosity", action="count",
-                       default=0, help="""Be verbose. Specify multiple times
+    group.add_argument("-v", "--verbose", dest="verbosity", action=FlagCount,
+                       help="""Be verbose. Specify multiple times
                        for more verbosity.""")
 
-    group.add_argument("-H", "--header", metavar="FILE", help="""PRACTICE
-                        script to run before taking any other action (default:
-                        %(default)s).""", type=argparse.FileType('r'))
+    group.add_argument("-H", "--header", metavar="FILE", default=[],
+                       action='append', help="""PRACTICE script to run before
+                       taking any other action (default: %(default)s).""",
+                       type=path_readable)
 
-    group.add_argument("-F", "--footer", metavar="FILE", help="""PRACTICE
-                        script to run after finishing all other actions
-                        (default: None).""", type=argparse.FileType('r'))
+    group.add_argument("-F", "--footer", metavar="FILE", default=[],
+                       action='append', help="""PRACTICEscript to run after
+                       finishing all other actions (default: None).""",
+                       type=path_readable)
 
     group.add_argument("-u", "--usb-reset", action="store_true", help="""
                         Reset the Trace32 USB debug adapter before launching
@@ -164,23 +269,27 @@ def create_parser():
 
     parser.format_help()
 
-    parser.add_argument("ADDRESS", help="""Target address to read from the
-                        target. Hexadecimal addresses should start with a "0x"
-                        prefix.""", type=constant)
+    parser.add_argument("address", metavar="ADDRESS", help="""Target address to
+                        read from the target. Hexadecimal addresses should
+                        start with a "0x" prefix.""", type=constant)
 
-    parser.add_argument("OUTFILE", nargs="?", help="""Output file to write
-                        (default: stdout).""")
+    parser.add_argument("-b", "--blocksize", help="""Maximum blocksize to use
+                        for read operations (default: %(default)s).""",
+                        default="1M", type=constant)
+
+    parser.add_argument("-o", "--outfile", help="""Output file to write
+                        (default: stdout).""", type=path_writeable)
 
     group = parser.add_mutually_exclusive_group(required=True)
 
     group.add_argument("-r", "--reference", metavar="FILE", required=False,
                        help="""Read a number of bytes equal to the size of
                        FILE. Can be used for readbacks or other similar
-                       operations.""", type=argparse.FileType('r'))
+                       operations.""", type=path_readable)
 
     group.add_argument("-c", "--count", help="""Number of bytes to read,
-                       starting at ADDRESS and counting upwards (default:
-                       %(default)s).""", type=constant)
+                       starting at ADDRESS and counting upwards.""",
+                       type=constant)
 
     # ----------------------------------------------------------------------- #
 
@@ -202,10 +311,11 @@ def create_parser():
                         (default: stdin).""", type=argparse.FileType('rb'),
                         default=sys.stdin.buffer)
 
+    check_modes = ("full", "checksum", "partial", "none")
     parser.add_argument("-c", "--check", required=False, metavar="MODE",
-                        default="none", choices=("full", "checksum", "partial",
-                        "none"), help="""Checking mode for written data. Known
-                        modes are: [%(choices)s]. (default: %(default)s).""")
+                        default="none", choices=check_modes, help="""Checking
+                        mode for written data. Known modes are: [%(choices)s].
+                        (default: %(default)s).""")
 
     parser.add_argument("-s", "--scratchpad", required=False,
                         metavar="SPADDRESS", help="""Address for the 64kB
@@ -218,13 +328,19 @@ def create_parser():
     parser = subparsers.add_parser('run', help='Run a PRACTICE command',
                                    parents=child_common)
 
-    parser.add_argument("statement", metavar="STATEMENT", help="""Statement to
-                        evaluate/run. All positional argumentss are combined
-                        into a single %(metavar)s.""", nargs='*')
-
     parser.description = """Evaluate a Trace32/PRACTICE statement. Return the
     result if it can be parsed with EVAL, or else try to run it as a
     command."""
+
+    parser.add_argument("-c", "--command", action="store_true",
+                        help="""Evaluate STATEMENT as a PRACTICE
+                        command/TRACE32 statement instead of as a script
+                        filename.""")
+
+    parser.add_argument("statement", metavar="STATEMENT", help="""Script file
+                        to run (and arguments to provide to the script). If
+                        used with -c/--command, all STATEMENT words are joined
+                        to make a single TRACE32 expression. """, nargs="+")
 
     # ----------------------------------------------------------------------- #
 
@@ -242,29 +358,45 @@ def run_parser(parser):
     on the arguments. """
 
     args = parser.parse_args()
+
     return args
 
 
-# ---------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 
-def create_commenter(verbosity, prefix="# ", dest=sys.stdout):
+def create_commenter(verbosity: int, prefix: str = "# ",
+                     dest: io.IOBase = sys.stdout):
 
-    def comment(message: str, level: int=1):
+    """Returns a function that can be used for standardized logging of messages
+    from the CLI. All messages are associated with a verbosity (default 1) that
+    gets compared against the commenter's requested verbosity at creation-time.
+    Messages are only printed if the requested verbosity is high enough. """
+
+    def comment(message: str, level: int = 1):
         if verbosity >= level:
             dest.write(prefix + message + "\n")
 
     return comment
 
-# ---------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 
 
-def main():
+def _cli():
+    """ Function that implements the CLI. This is made separate from main()
+    to allow for standardized exception handling. """
+
     parser = create_parser()
     args = run_parser(parser)
-    args.log = create_commenter(args.verbosity)
+
+    if (args.subcommand == 'read') and not args.outfile:
+        args.logdest = sys.stderr
+    else:
+        args.logdest = sys.stdout
+
+    args.log = create_commenter(args.verbosity, dest=args.logdest)
 
     if args.subcommand is None:
-        parser.error(f"COMMAND not specified.")
+        parser.error("COMMAND not specified.")
 
     if args.subcommand in ['gdb', 'serve']:
         parser.error(f"subcommand [{args.subcommand}] isn't implemented yet.")
@@ -282,7 +414,6 @@ def main():
         usb_reset()
         args.log("Reset completed OK.", level=2)
 
-
     if args.protocol.lower() == "usb":
         sp_kwargs = {"podbus": Podbus.USB}
     else:
@@ -290,38 +421,44 @@ def main():
 
     args.log("Launching TRACE32.")
     with Trace32Subprocess(args.t32bin, **sp_kwargs) as proc:
-        args.log("Trace32 launched OK.", level=2)
+        args.log("TRACE32 launched OK.", level=2)
 
         with Trace32Interface(port=proc.port, tempdir=proc.tempdir) as iface:
             args.log("Remote interface connected OK.", level=2)
 
-            if args.header:
-                args.log(f"Running header script [{args.header.name}].")
-
-                if args.header.seekable():
-                    iface.run_scriptfile(args.header.name, logfile=sys.stdout)
-                else:
-                    iface.run_script(args.header.read(), logfile=sys.stdout)
-
-                args.log(f"Header script completed OK.")
+            for script in args.header:
+                args.log(f"Running header script [{script}].")
+                iface.run_file(script, logfile=args.logdest)
+                args.log("Header script completed OK.")
 
             args.log(f"Launching command [{args.subcommand}].", level=2)
-            result = commands[args.subcommand](args)
+            result = commands[args.subcommand](args, iface)
             args.log(f"Command [{args.subcommand}] completd OK.", level=2)
 
-            if args.footer:
-                args.log(f"Running footer script [{args.header.name}].")
+            for script in args.footer:
+                args.log(f"Running footer script [{script}].")
+                iface.run_file(script, logfile=args.logdest)
+                args.log("Footer script completed OK.")
 
-                if args.footer.seekable():
-                    iface.run_scriptfile(args.footer.name, logfile=sys.stdout)
-                else:
-                    iface.run_script(args.footer.read(), logfile=sys.stdout)
-
-                args.log(f"Footer script completed OK.")
-
+        args.log("Disconnected OK.", level=2)
+        args.log("Terminating TRACE32.", level=2)
+    args.log("TRACE32 terminated OK.", level=1)
     return result
 
-    print(args)
+
+def main():
+    """ Main function for launching the CLI. """
+
+    if os.environ.get("DEBUG", "").lower() in ["1", "yes", "true"]:
+        return _cli()
+
+    try:
+        # pylint: disable=broad-except
+        return _cli()
+
+    except Exception as err:
+        dump_exception(err)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
