@@ -12,7 +12,7 @@ import time
 from .t32run import usb_reset, Trace32Subprocess
 from .t32run import find_trace32_dir, find_trace32_bin, Podbus
 
-from .t32api import Trace32Interface
+from .t32iface import Trace32Interface
 
 # --------------------------------------------------------------------------- #
 
