@@ -7,6 +7,7 @@ import sys
 import re
 import os
 import io
+import time
 
 from .t32run import usb_reset, Trace32Subprocess
 from .t32run import find_trace32_dir, find_trace32_bin, Podbus
@@ -428,20 +429,30 @@ def _cli():
 
             for script in args.header:
                 args.log(f"Running header script [{script}].")
+                start = time.monotonic()
                 iface.run_file(script, logfile=args.logdest)
+                stop = time.monotonic()
                 args.log("Header script completed OK.")
+                args.log("(runtime: %.2f sec)" % (stop - start), level=3)
 
             args.log(f"Launching command [{args.subcommand}].", level=2)
+            start = time.monotonic()
             result = commands[args.subcommand](args, iface)
+            stop = time.monotonic()
             args.log(f"Command [{args.subcommand}] completd OK.", level=2)
+            args.log("(runtime: %.2f sec)" % (stop - start), level=3)
 
             for script in args.footer:
                 args.log(f"Running footer script [{script}].")
+                start = time.monotonic()
                 iface.run_file(script, logfile=args.logdest)
+                stop = time.monotonic()
                 args.log("Footer script completed OK.")
+                args.log("(runtime: %.2f sec)" % (stop - start), level=3)
 
         args.log("Disconnected OK.", level=2)
         args.log("Terminating TRACE32.", level=2)
+
     args.log("TRACE32 terminated OK.", level=1)
     return result
 
