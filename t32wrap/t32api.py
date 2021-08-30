@@ -13,6 +13,7 @@ import time
 import tempfile
 import random
 import multiprocessing as mp
+import sys
 
 from .t32api_errors import Errcode
 from .common import register_cleanup, make_tempdir
@@ -591,12 +592,57 @@ class Trace32Interface:
         else:
             self.api.T32_Exit()
 
+    @staticmethod
+    def _try_attach(libfile, node, port, packlen):
+        """ Utility function that initializes a Trace32 API session and then
+        closes it. Intended to be used as a background task to validate
+        connectivity with Trace32. """
+        try:
+            api = Trace32API(libfile)
+            api.T32_Config("NODE=", node)
+            api.T32_Config("PORT=", port)
+
+            if packlen:
+                api.T32_Config("PACKLEN=", packlen)
+
+            api.T32_Init()
+            api.T32_Attach()
+            api.T32_Exit()
+        except CommunicationError:
+            sys.exit(1)
+
     def connect(self, node="localhost", port=20000, packlen=None, timeout=10):
         """ Connect to a Trace32 instance. """
 
         self.node = node
         self.port = port
         self.packlen = packlen
+
+        timeout_time = time.time() + timeout
+
+        while True:
+            if time.time() > timeout_time:
+                raise CommunicationError("init/attach timeout", 1)
+
+            args = (self.libfile, self.node, self.port, self.packlen)
+            proc = mp.Process(target=self._try_attach, args=args, daemon=True)
+            proc.start()
+            attach_timeout = time.time() + 0.5
+            while True:
+                if (time.time() > attach_timeout) or not proc.is_alive():
+                    break
+
+                if time.time() > timeout_time:
+                    raise CommunicationError("init/attach timeout", 1)
+
+                time.sleep(0.01)
+
+            if proc.is_alive():
+                proc.terminate()
+
+            elif proc.exitcode == 0:
+                break
+
         self.api.T32_Config("NODE=", node)
         self.api.T32_Config("PORT=", port)
 
@@ -604,9 +650,11 @@ class Trace32Interface:
             self.api.T32_Config("PACKLEN=", packlen)
 
         init_ok = False
-        maxtime = time.time() + timeout
 
-        while time.time() < maxtime:
+        while True:
+            if time.time() > timeout_time:
+                raise CommunicationError("init/attach timeout", 1)
+
             try:
                 self.api.T32_Init()
                 init_ok = True
@@ -748,9 +796,13 @@ class Trace32Interface:
 
         api.T32_Exit()
 
-    def run_scriptfile(self, scriptfile, logfile=None):
+    def run_file(self, scriptfile, args=(), logfile=None):
         """ Run a PRACTICE script that exists on the filesystem. """
-        # pylint: disable=too-many-locals
+        # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+
+        # Author's comment: this function is barely over the limit on the
+        # pylint defaults disabled above. I can't figure out how to get under
+        # the limit without reducing clarity.
 
         buffer = ""
         script = open(scriptfile).read().strip()
@@ -763,7 +815,12 @@ class Trace32Interface:
             raise ValueError(err_msg % scriptfile)
 
         msgline_flag = self.clear_area()
-        self.api.T32_ExecuteCommand(f"DO {os.path.abspath(scriptfile)}")
+
+        cmd = f"DO {os.path.abspath(scriptfile)}"
+        if args:
+            cmd += " " + " ".join(args)
+
+        self.api.T32_ExecuteCommand(cmd)
 
         # A background task is used to poll Trace32 and wait until the script
         # exits. This allows us to continue retrieving FIFO data while the
@@ -843,7 +900,7 @@ class Trace32Interface:
 
         return buffer
 
-    def run_script(self, script, logfile=None):
+    def run_script(self, script, args = (), logfile=None):
         """ Run a PRACTICE script supplied as a string. """
 
         lines = re.sub("^;.*?$", "", script.strip(), flags=re.M).splitlines()
@@ -857,7 +914,7 @@ class Trace32Interface:
                                          mode="w+") as outfile:
             outfile.write(script)
             outfile.flush()
-            result = self.run_scriptfile(outfile.name, logfile)
+            result = self.run_file(outfile.name, args=args, logfile=logfile)
 
         return result
 
@@ -948,15 +1005,3 @@ class Trace32Interface:
             return result
 
         return self._decode_eval_result(result)
-
-
-def _main():
-    iface = Trace32Interface()
-    iface.connect(port=30000)
-    iface.ping()
-    iface.disconnect()
-    print("Connection test OK.")
-
-
-if __name__ == "__main__":
-    _main()
