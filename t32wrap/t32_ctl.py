@@ -240,10 +240,10 @@ def common_options(toplevel=False):
                        communicating with the target. Known protocols are:
                        [usb, sim] (default: usb).""")
 
-    group.add_argument("-t", "--t32bin", metavar="TRACE32", default="t32marm",
-                       type=trace32_binary, help="""Trace32 binary to use.
-                       Controls the target architecture (default:
-                       %(default)s).""")
+    group.add_argument("-t", "--t32bin", metavar="TRACE32BIN",
+                       default="t32marm", type=trace32_binary, help="""Trace32
+                       binary to use. Controls the target architecture
+                       (default: %(default)s).""")
 
     return parser
 

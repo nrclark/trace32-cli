@@ -72,6 +72,7 @@ def until_keyword(file_obj, keyword, maxblock=None, poll_rate=None):
 
 # --------------------------------------------------------------------------- #
 
+
 class Trace32Interface:
     """ High-level Trace32 interface that provides better-integrated functions
     for running commands and/or scripts, and evaluating literals. The interface
@@ -152,6 +153,33 @@ class Trace32Interface:
         self.port = port
         self.packlen = packlen
 
+        self._connect_lowlevel(timeout)
+
+        name = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(8)]
+        self.area = ''.join(name)
+
+        # The geometry of this window was experimentally determined by hunting
+        # around. Trace32 doesn't let you make an infinite-sized window, but
+        # also doesn't clearly state where the limits are. Experimentally,
+        # the limit is a 4095x32767-sized window. We don't need to buffer that
+        # many lines though, since we're configuring the AREA to pipe directly
+        # out to a FIFO.
+
+        cmds = [
+            f"AREA.Create {self.area} 4095. 1024.",
+            f"AREA.OPEN {self.area} {self.fifo_name} /Append /NoFileCache",
+            f"AREA.Select {self.area}"
+        ]
+
+        while self.fifo.read(4096):
+            pass
+
+        for cmd in cmds:
+            self.api.T32_Cmd(cmd)
+
+    def _connect_lowlevel(self, timeout=10):
+        """ Connect to a Trace32 instance. """
+
         timeout_time = time.time() + timeout
 
         while True:
@@ -177,11 +205,11 @@ class Trace32Interface:
             elif proc.exitcode == 0:
                 break
 
-        self.api.T32_Config("NODE=", node)
-        self.api.T32_Config("PORT=", port)
+        self.api.T32_Config("NODE=", self.node)
+        self.api.T32_Config("PORT=", self.port)
 
-        if packlen:
-            self.api.T32_Config("PACKLEN=", packlen)
+        if self.packlen:
+            self.api.T32_Config("PACKLEN=", self.packlen)
 
         init_ok = False
 
@@ -204,28 +232,20 @@ class Trace32Interface:
 
         self.api.T32_Attach()
         self.api.T32_Ping()
+        self.connected = True
 
-        name = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(8)]
-        self.area = ''.join(name)
+    def _reconnect(self):
+        """ Reconnect to a preconfigured to a Trace32 instance. """
 
-        # The geometry of this window was experimentally determined by hunting
-        # around. Trace32 doesn't let you make an infinite-sized window, but
-        # also doesn't clearly state where the limits are. Experimentally,
-        # the limit is a 4095x32767-sized window. We don't need to buffer that
-        # many lines though, since we're configuring the AREA to pipe directly
-        # out to a FIFO.
+        self.api.T32_Config("NODE=", self.node)
+        self.api.T32_Config("PORT=", self.port)
 
-        cmds = [
-            f"AREA.Create {self.area} 4095. 1024.",
-            f"AREA.OPEN {self.area} {self.fifo_name} /Append /NoFileCache",
-            f"AREA.Select {self.area}"
-        ]
+        if self.packlen:
+            self.api.T32_Config("PACKLEN=", self.packlen)
 
-        while self.fifo.read(4096):
-            pass
-
-        for cmd in cmds:
-            self.api.T32_Cmd(cmd)
+        self.api.T32_Init()
+        self.api.T32_Attach()
+        self.api.T32_Ping()
 
         self.connected = True
 
@@ -330,15 +350,9 @@ class Trace32Interface:
 
         api.T32_Exit()
 
-    def run_file(self, scriptfile, args=(), logfile=None):
-        """ Run a PRACTICE script that exists on the filesystem. """
-        # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-
-        # Author's comment: this function is barely over the limit on the
-        # pylint defaults disabled above. I can't figure out how to get under
-        # the limit without reducing clarity.
-
-        buffer = ""
+    @staticmethod
+    def _validate_script(scriptfile):
+        """ Sanity-check a PRACTICE script before running it. """
         script = open(scriptfile).read().strip()
         lines = re.sub("^[ \t]*;.*?$", "", script, flags=re.M).splitlines()
         lines = [x.strip() for x in lines]
@@ -348,6 +362,11 @@ class Trace32Interface:
             err_msg = "Error: %s is missing final ENDDO statement."
             raise ValueError(err_msg % scriptfile)
 
+    def run_file(self, scriptfile, args=(), logfile=None):
+        """ Run a PRACTICE script that exists on the filesystem. """
+
+        buffer = ""
+        self._validate_script(scriptfile)
         msgline_flag = self.clear_area()
 
         cmd = f"DO {os.path.abspath(scriptfile)}"
@@ -366,6 +385,7 @@ class Trace32Interface:
         # after the background task is completed.
 
         self.api.T32_Exit()
+        self.connected = False
         caught_exception = None
 
         args = (self.libfile, self.node, self.port, self.packlen)
@@ -394,14 +414,7 @@ class Trace32Interface:
         # is re-initialized.
 
         proc.terminate()
-        self.api.T32_Config("NODE=", self.node)
-        self.api.T32_Config("PORT=", self.port)
-
-        if self.packlen:
-            self.api.T32_Config("PACKLEN=", self.packlen)
-
-        self.api.T32_Init()
-        self.api.T32_Ping()
+        self._reconnect()
 
         if caught_exception:
             raise caught_exception
@@ -430,11 +443,11 @@ class Trace32Interface:
             buffer += "\n" + message_string['msg']
             err_types = [MessageType.Error, MessageType.Error_Info]
             if [x for x in message_string['types'] if x in err_types]:
-                raise ScriptFailure(script, message_string)
+                raise ScriptFailure(scriptfile, message_string)
 
         return buffer
 
-    def run_script(self, script, args = (), logfile=None):
+    def run_script(self, script, args=(), logfile=None):
         """ Run a PRACTICE script supplied as a string. """
 
         lines = re.sub("^;.*?$", "", script.strip(), flags=re.M).splitlines()
@@ -448,9 +461,11 @@ class Trace32Interface:
                                          mode="w+") as outfile:
             outfile.write(script)
             outfile.flush()
-            result = self.run_file(outfile.name, args=args, logfile=logfile)
-
-        return result
+            try:
+                return self.run_file(outfile.name, args=args, logfile=logfile)
+            except ScriptFailure as err:
+                err.script = script
+                raise err
 
     def run_command(self, cmd, logfile=None):
         """ Run a single command and return the result. Optionally, also write
