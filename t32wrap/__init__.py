@@ -3,8 +3,8 @@
 from .t32run import Trace32Subprocess, Podbus, usb_reset
 from .t32run import find_trace32_bin, find_trace32_dir
 
-from .t32api import Trace32Interface
-from .t32api import ApiError, CallFailure, CommandFailure, ScriptFailure
+from .t32iface import Trace32Interface, ScriptFailure
+from .t32api import ApiError, CallFailure, CommandFailure
 from .t32api import EvalError
 
 from .t32_ctl import main
