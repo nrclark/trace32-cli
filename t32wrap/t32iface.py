@@ -13,8 +13,8 @@ import multiprocessing as mp
 import sys
 
 
-from .t32api import Trace32API, CommunicationError, PracticeState, MessageType
-from .t32api import ResultType, EvalError
+from .t32api import Trace32API, PracticeState, MessageType, ResultType
+from .t32api import EvalError, CommandFailure, CommunicationError
 from .common import register_cleanup, make_tempdir
 
 # --------------------------------------------------------------------------- #
@@ -471,7 +471,10 @@ class Trace32Interface:
         """ Run a single command and return the result. Optionally, also write
         the result to a logfile as its received. """
 
-        self.clear_area()
+        msgline_flag = self.clear_area()
+        while self.fifo.read(4096):
+            pass
+
         self.api.T32_ExecuteCommand(cmd)
 
         flag = [chr(random.randint(ord('A'), ord('Z'))) for _ in range(16)]
@@ -493,6 +496,18 @@ class Trace32Interface:
         if logfile:
             if len(buffer) > 1 and buffer[-1] != '\n':
                 logfile.write('\n')
+
+        message_string = self.api.T32_GetMessageString()
+
+        if message_string['msg'] != msgline_flag:
+            err_types = [MessageType.Error, MessageType.Error_Info]
+            if [x for x in message_string['types'] if x in err_types]:
+                raise CommandFailure(cmd, message_string['msg'].strip())
+
+            if logfile:
+                msg = message_string['msg'].strip()
+                if msg:
+                    logfile.write(msg + '\n')
 
         return buffer
 
