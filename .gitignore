@@ -1,3 +1,7 @@
 __pycache__/
 trace32_cli/t32api_errors.py
 *.so
+syntax32/*.json
+syntax32/files/
+syntax32/help.t32
+syntax32/practice.uew
