@@ -48,6 +48,79 @@ def read(args, iface: Trace32Interface):
         outfile.close()
 
 
+def _write_api(args, iface: Trace32Interface):
+    """ Write data to memory using C-API calls. Knows 'none' and 'full'
+    modes. """
+
+    address = args.address
+
+    while True:
+        block = args.infile.read(args.blocksize)
+
+        if not block:
+            return True
+
+        args.log(f"Writing {len(block)} bytes to {hex(address)}", level=3)
+        iface.write_memory(address, block)
+
+        if args.check == "full":
+            msg = f"Verifying {len(block)} bytes at {hex(address)}"
+            args.log(msg, level=3)
+            readback = iface.read_memory(address, len(block))
+            assert readback == block
+
+        address += len(block)
+
+
+def _write_practice(args, iface: Trace32Interface):
+    """ Write data to memory using PRACTICE DATA.LOAD.BINARY commands. Knows
+    how to use "sparse" and "checksum" modes. """
+
+    address = args.address
+    logfile = args.logdest if (args.verbosity >= 3) else None
+    base_command = 'Data.LOAD.Binary @filename @start++@size'
+    completed = 0
+
+    if args.infile.seekable() and os.path.isfile(args.infile.name):
+        buffer_file = None
+        base_command = base_command.replace("@filename", args.infile.name)
+        base_command += " /SKIP @skip"
+        total = args.infile.seek(0, io.SEEK_END)
+    else:
+        buffer_file = os.path.join(iface.tempdir, "buffer.bin")
+        base_command = base_command.replace("@filename", buffer_file)
+        total = None
+
+    if args.check == "sparse":
+        base_command += " /PVerify"
+    else:
+        base_command += f" /CHECKLOAD {hex(args.scratchpad)}++0xFFFF"
+
+    while True:
+        if buffer_file:
+            block = args.infile.read(args.blocksize)
+            with open(buffer_file, "wb") as outfile:
+                outfile.write(block)
+            chunksize = len(block)
+        else:
+            chunksize = min(total - completed, args.blocksize)
+
+        if chunksize == 0:
+            return
+
+        if args.check == "checksum":
+            scratchpad_avoid(address, chunksize, args.scratchpad)
+
+        cmd = base_command.replace("@start", hex(address))
+        cmd = cmd.replace("@size", hex(chunksize - 1))
+        cmd = cmd.replace("@skip", hex(completed))
+
+        args.log(f"Running [{cmd}]", level=3)
+        iface.run_command(cmd, logfile=logfile)
+        completed += chunksize
+        address += chunksize
+
+
 def write(args, iface: Trace32Interface):
     """ Routine for writing data to the target's memory from stdin or an
     infile. """
@@ -55,73 +128,19 @@ def write(args, iface: Trace32Interface):
     if args.infile is not sys.stdin.buffer:
         args.log(f"Using file [{args.infile.name}] as input.", level=1)
     else:
-        args.log(f"Using stdin as input.", level=1)
+        args.log("Using stdin as input.", level=1)
 
     address = args.address
     msg = f"Writing to {hex(address)} with a verify-mode of [{args.check}]."
     args.log(msg, level=1)
 
     if args.check in ("none", "full"):
-        while True:
-            block = args.infile.read(args.blocksize)
-
-            if not block:
-                return
-
-            args.log(f"Writing {len(block)} bytes to {hex(address)}", level=3)
-            iface.write_memory(address, block)
-
-            if args.check == "full":
-                msg = f"Verifying {len(block)} bytes at {hex(address)}"
-                args.log(msg, level=3)
-                readback = iface.read_memory(address, len(block))
-                assert readback == block
-
-            address += len(block)
+        return _write_api(args, iface)
 
     if args.check in ("sparse", "checksum"):
-        logfile = args.logdest if (args.verbosity >= 3) else None
-        base_command = 'Data.LOAD.Binary @filename @start++@size'
-        completed = 0
+        return _write_practice(args, iface)
 
-        if args.infile.seekable() and os.path.isfile(args.infile.name):
-            buffer_file = None
-            base_command = base_command.replace("@filename", args.infile.name)
-            base_command += " /SKIP @skip"
-            total = args.infile.seek(0, io.SEEK_END)
-        else:
-            buffer_file = os.path.join(iface.tempdir, "buffer.bin")
-            base_command = base_command.replace("@filename", buffer_file)
-            total = None
-
-        if args.check == "sparse":
-            base_command += " /PVerify"
-        else:
-            base_command += f" /CHECKLOAD {hex(args.scratchpad)}++0xFFFF"
-
-        while True:
-            if buffer_file:
-                block = args.infile.read(args.blocksize)
-                with open(buffer_file, "wb") as outfile:
-                    outfile.write(block)
-                chunksize = len(block)
-            else:
-                chunksize = min(total - completed, args.blocksize)
-
-            if chunksize == 0:
-                return
-
-            if args.check == "checksum":
-                scratchpad_avoid(address, chunksize, args.scratchpad)
-
-            cmd = base_command.replace("@start", hex(address))
-            cmd = cmd.replace("@size", hex(chunksize - 1))
-            cmd = cmd.replace("@skip", hex(completed))
-
-            args.log(f"Running [{cmd}]", level=3)
-            iface.run_command(cmd, logfile=logfile)
-            completed += chunksize
-            address += chunksize
+    raise ValueError(f"Unknown checker mode [{args.check}]")
 
 
 def run(args, iface: Trace32Interface):
@@ -146,6 +165,7 @@ def scratchpad_avoid(start, length, scratchpad, scratchpad_size=64*1024):
     spans from lower_bound to upper_bound. Throws an exception if it does.
     This function can be used to ensure that a checksum scratchpad won't
     accidentally clobber the memory that it's trying to checkum. """
+    # pylint: disable=chained-comparison
 
     for index in (scratchpad, scratchpad + scratchpad_size):
         if (index >= start) and (index < (start + length)):
@@ -329,7 +349,7 @@ def make_append(storage: dict, key):
     return GlobalAppender
 
 
-def common_options(storage: dict, toplevel: bool=False):
+def common_options(storage: dict, toplevel: bool = False):
     """ These options are shared by all commands in the utility. They're used
     to set up the Trace32 instance, or to tear it down/launch a target after
     programming. """
