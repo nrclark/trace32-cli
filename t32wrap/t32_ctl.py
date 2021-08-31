@@ -48,25 +48,125 @@ def read(args, iface: Trace32Interface):
         outfile.close()
 
 
-def write(args):
+def write(args, iface: Trace32Interface):
     """ Routine for writing data to the target's memory from stdin or an
     infile. """
 
-    pass
+    if args.infile is not sys.stdin.buffer:
+        args.log(f"Using file [{args.infile.name}] as input.", level=1)
+    else:
+        args.log(f"Using stdin as input.", level=1)
+
+    address = args.address
+    msg = f"Writing to {hex(address)} with a verify-mode of [{args.check}]."
+    args.log(msg, level=1)
+
+    if args.check in ("none", "full"):
+        while True:
+            block = args.infile.read(args.blocksize)
+
+            if not block:
+                return
+
+            args.log(f"Writing {len(block)} bytes to {hex(address)}", level=3)
+            iface.write_memory(address, block)
+
+            if args.check == "full":
+                msg = f"Verifying {len(block)} bytes at {hex(address)}"
+                args.log(msg, level=3)
+                readback = iface.read_memory(address, len(block))
+                assert readback == block
+
+            address += len(block)
+
+    if args.check in ("sparse", "checksum"):
+        logfile = args.logdest if (args.verbosity >= 3) else None
+        base_command = 'Data.LOAD.Binary @filename @start++@size'
+        completed = 0
+
+        if args.infile.seekable() and os.path.isfile(args.infile.name):
+            buffer_file = None
+            base_command = base_command.replace("@filename", args.infile.name)
+            base_command += " /SKIP @skip"
+            total = args.infile.seek(0, io.SEEK_END)
+        else:
+            buffer_file = os.path.join(iface.tempdir, "buffer.bin")
+            base_command = base_command.replace("@filename", buffer_file)
+            total = None
+
+        if args.check == "sparse":
+            base_command += " /PVerify"
+        else:
+            base_command += f" /CHECKLOAD {hex(args.scratchpad)}++0xFFFF"
+
+        while True:
+            if buffer_file:
+                block = args.infile.read(args.blocksize)
+                with open(buffer_file, "wb") as outfile:
+                    outfile.write(block)
+                chunksize = len(block)
+            else:
+                chunksize = min(total - completed, args.blocksize)
+
+            if chunksize == 0:
+                return
+
+            if args.check == "checksum":
+                scratchpad_avoid(address, chunksize, args.scratchpad)
+
+            cmd = base_command.replace("@start", hex(address))
+            cmd = cmd.replace("@size", hex(chunksize - 1))
+            cmd = cmd.replace("@skip", hex(completed))
+
+            args.log(f"Running [{cmd}]", level=3)
+            iface.run_command(cmd, logfile=logfile)
+            completed += chunksize
+            address += chunksize
 
 
-def run(args, iface):
+def run(args, iface: Trace32Interface):
     """ Routine for running a PRACTICE/TRACE32 command or script. """
 
     if args.command:
         cmd = ' '.join(args.statement)
+        args.log(f"Running command [{cmd}]", level=2)
         iface.run_command(cmd, logfile=args.logdest)
 
     else:
         script = args.statement[0]
+        args.log(f"Running script [{script}] with args {args.statement[1:]}",
+                 level=2)
         iface.run_file(script, args.statement[1:], logfile=args.logdest)
 
 # --------------------------------------------------------------------------- #
+
+
+def scratchpad_avoid(start, length, scratchpad, scratchpad_size=64*1024):
+    """ Checks to see if a scratchpad overlaps with the address range that
+    spans from lower_bound to upper_bound. Throws an exception if it does.
+    This function can be used to ensure that a checksum scratchpad won't
+    accidentally clobber the memory that it's trying to checkum. """
+
+    for index in (scratchpad, scratchpad + scratchpad_size):
+        if (index >= start) and (index < (start + length)):
+            msg = "Scratchpad overlaps with target region 0x%X-0x%X"
+            msg %= (length, (start + length - 1))
+            raise argparse.ArgumentError(None, msg)
+
+
+def create_commenter(verbosity: int, prefix: str = "# ",
+                     dest: io.IOBase = sys.stdout):
+
+    """Returns a function that can be used for standardized logging of messages
+    from the CLI. All messages are associated with a verbosity (default 1) that
+    gets compared against the commenter's requested verbosity at creation-time.
+    Messages are only printed if the requested verbosity is high enough. """
+
+    def comment(message: str, level: int = 1):
+        if verbosity >= level:
+            dest.write(prefix + message + "\n")
+
+    return comment
 
 
 def dump_exception(exception, fileobj=sys.stderr):
@@ -192,19 +292,44 @@ def modify_add_argument(parent):
     parent.add_argument = make_arg
 
 
-class FlagCount(argparse._CountAction):
-    """ Custom vesion of _CountAction (used by argparse to implement the
-    'count' action) that is cumulative across subparsers. """
-    # pylint: disable=protected-access,too-few-public-methods
+def make_count(storage: dict, key):
+    """ Creates an argparse action that's based on 'count', except it stores
+    into an externally-provided dict. This ensures that the action works
+    when mixed in-between a subparser and a main parser."""
 
-    _flag_count = 0
+    if key not in storage:
+        storage[key] = 0
 
-    def __call__(self, parser, namespace, values, option_string=None):
-        FlagCount._flag_count += 1
-        setattr(namespace, self.dest, type(self)._flag_count)
+    # pylint: disable=protected-access
+
+    class GlobalCounter(argparse._CountAction):
+        # pylint: disable=missing-class-docstring,too-few-public-methods
+        def __call__(self, parser, namespace, values, option_string=None):
+            storage[key] += 1
+            setattr(namespace, self.dest, storage[key])
+
+    return GlobalCounter
 
 
-def common_options(toplevel=False):
+def make_append(storage: dict, key):
+    """ Creates an argparse action that'sn based on 'append', except it stores
+    into an externally-provided dict. This ensures that the action works
+    when mixed in-between a subparser and a main parser. """
+
+    if key not in storage:
+        storage[key] = []
+
+    # pylint: disable=protected-access
+    class GlobalAppender(argparse._AppendAction):
+        # pylint: disable=missing-class-docstring,too-few-public-methods
+        def __call__(self, parser, namespace, values, option_string=None):
+            storage[key].append(values)
+            setattr(namespace, self.dest, storage[key])
+
+    return GlobalAppender
+
+
+def common_options(storage: dict, toplevel: bool=False):
     """ These options are shared by all commands in the utility. They're used
     to set up the Trace32 instance, or to tear it down/launch a target after
     programming. """
@@ -217,19 +342,19 @@ def common_options(toplevel=False):
     group = parser.add_argument_group(title="common options")
     modify_add_argument(group)
 
-    group.add_argument("-v", "--verbose", dest="verbosity", action=FlagCount,
-                       help="""Be verbose. Specify multiple times
-                       for more verbosity.""")
+    group.add_argument("-v", "--verbose", dest="verbosity", help="""Be verbose.
+                       Specify multiple times for more verbosity.""",
+                       action=make_count(storage, 'verbose'))
 
-    group.add_argument("-H", "--header", metavar="FILE", default=[],
-                       action='append', help="""PRACTICE script to run before
-                       taking any other action (default: %(default)s).""",
-                       type=path_readable)
+    group.add_argument("-H", "--header", metavar="FILE", type=path_readable,
+                       action=make_append(storage, 'headers'), help="""PRACTICE
+                       script to run before taking any other action
+                       (default: %(default)s).""", )
 
-    group.add_argument("-F", "--footer", metavar="FILE", default=[],
-                       action='append', help="""PRACTICEscript to run after
-                       finishing all other actions (default: None).""",
-                       type=path_readable)
+    group.add_argument("-F", "--footer", metavar="FILE", type=path_readable,
+                       action=make_append(storage, 'footers'), help="""PRACTICE
+                       script to run after finishing all other actions
+                       (default: None).""")
 
     group.add_argument("-u", "--usb-reset", action="store_true", help="""
                         Reset the Trace32 USB debug adapter before launching
@@ -250,8 +375,9 @@ def common_options(toplevel=False):
 
 def create_parser():
     """ Generates and returns an argparse instance for the CLI tool. """
-    parent_common = [common_options(True)]
-    child_common = [common_options(False)]
+    storage = {}
+    parent_common = [common_options(storage, True)]
+    child_common = [common_options(storage, False)]
 
     top_parser = argparse.ArgumentParser(parents=parent_common)
     top_parser.description = """Command-line tool that uses Lauterbach Trace32
@@ -299,20 +425,20 @@ def create_parser():
 
     parser.description = """ Write a file to the target's memory. Optionally
     check the result of the write operation using one of three modes: full,
-    partial, and checksum. In [full] verification mode, the write is fully
-    verified. In [partial] verification mode, 1/16 of all writes are verified.
+    sparse, and checksum. In [full] verification mode, the write is fully
+    verified. In [sparse] verification mode, 1/16 of all writes are verified.
     In [checksum] verification mode, Trace32 uploads a temporary program into
     SPADDRESS and uses it to checksum the target region. """
 
-    parser.add_argument("ADDRESS", help="""Target address to read from the
-                        target. Hexadecimal addresses should start with a "0x"
-                        prefix.""", type=constant)
+    parser.add_argument("address", metavar="ADDRESS", help="""Target address to
+                        read from the target. Hexadecimal addresses should
+                        start with a "0x" prefix.""", type=constant)
 
-    parser.add_argument("INFILE", nargs="?", help="""Input file to write
-                        (default: stdin).""", type=argparse.FileType('rb'),
-                        default=sys.stdin.buffer)
+    parser.add_argument("infile", metavar="INFILE", nargs="?", help="""Input
+                        file to write (default: stdin).""",
+                        type=argparse.FileType('rb'), default=sys.stdin.buffer)
 
-    check_modes = ("full", "checksum", "partial", "none")
+    check_modes = ("full", "checksum", "sparse", "none")
     parser.add_argument("-c", "--check", required=False, metavar="MODE",
                         default="none", choices=check_modes, help="""Checking
                         mode for written data. Known modes are: [%(choices)s].
@@ -323,6 +449,10 @@ def create_parser():
                         scratchpad region needed on-target for 'checksum'
                         verification mode. Ignored unless -c/--check=checksum
                         is used. (default: %(default)s).""", type=constant)
+
+    parser.add_argument("-b", "--blocksize", help="""Maximum blocksize to use
+                        for read operations (default: %(default)s).""",
+                        default="1M", type=constant)
 
     # ----------------------------------------------------------------------- #
 
@@ -360,24 +490,26 @@ def run_parser(parser):
 
     args = parser.parse_args()
 
+    if args.footer is None:
+        args.footer = []
+
+    if args.header is None:
+        args.header = []
+
+    if (args.subcommand == 'write') and (args.check == 'checksum'):
+        if args.scratchpad is None:
+            msg = "SPADDRESS must be specified for 'checksum' validation mode."
+            raise argparse.ArgumentError(None, msg)
+
+        if (args.scratchpad % 16) != 0:
+            msg = "SPADDRESS must be on a 16-byte boundary."
+            raise argparse.ArgumentError(None, msg)
+
+        if args.infile.seekable():
+            length = args.infile.seek(0, io.SEEK_END)
+            scratchpad_avoid(args.address, length, args.scratchpad)
+
     return args
-
-
-# --------------------------------------------------------------------------- #
-
-def create_commenter(verbosity: int, prefix: str = "# ",
-                     dest: io.IOBase = sys.stdout):
-
-    """Returns a function that can be used for standardized logging of messages
-    from the CLI. All messages are associated with a verbosity (default 1) that
-    gets compared against the commenter's requested verbosity at creation-time.
-    Messages are only printed if the requested verbosity is high enough. """
-
-    def comment(message: str, level: int = 1):
-        if verbosity >= level:
-            dest.write(prefix + message + "\n")
-
-    return comment
 
 # --------------------------------------------------------------------------- #
 
