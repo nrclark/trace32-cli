@@ -7,11 +7,11 @@ from .t32iface import Trace32Interface, ScriptFailure
 from .t32api import ApiError, CallFailure, CommandFailure
 from .t32api import EvalError
 
-from .t32_ctl import main
+from .trace32_cli import main
 
 # pylint: disable=undefined-variable
 del t32run
-del t32_ctl
+del trace32_cli
 del t32api
 del t32api_errors
 del common

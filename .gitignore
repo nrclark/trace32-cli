@@ -1,3 +1,3 @@
 __pycache__/
-t32wrap/t32api_errors.py
+trace32_cli/t32api_errors.py
 *.so
