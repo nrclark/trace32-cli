@@ -10,6 +10,8 @@ capi/
 trace32_cli/t32api_errors.py
 trace32_cli/VERSION
 *.so
+*.o
+*.d
 
 syntax32/*.json
 syntax32/files/

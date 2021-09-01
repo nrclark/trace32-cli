@@ -520,6 +520,14 @@ def run_parser(parser):
     if args.header is None:
         args.header = []
 
+    if args.verbosity is None:
+        args.verbosity = 0
+
+    if (args.subcommand == 'run') and not args.command:
+        if not os.path.exists(args.statement[0]):
+            msg = f"PRACTICE script-file [{args.statement[0]}] doesn't exist."
+            raise argparse.ArgumentError(None, msg)
+
     if (args.subcommand == 'write') and (args.check == 'checksum'):
         if args.scratchpad is None:
             msg = "SPADDRESS must be specified for 'checksum' validation mode."

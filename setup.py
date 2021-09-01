@@ -90,6 +90,7 @@ def generate_errfile(header_file="capi/src/t32.h",
 
         import enum
 
+
         class Errcode(enum.IntEnum):
             @enum_docstring@
             @enum_codes@
