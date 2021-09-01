@@ -1,6 +1,16 @@
 __pycache__/
+.eggs/
+build/
+dist/
+trace32_cli.egg-info/
+
+/*capi*.zip
+capi/
+
 trace32_cli/t32api_errors.py
+trace32_cli/VERSION
 *.so
+
 syntax32/*.json
 syntax32/files/
 syntax32/help.t32

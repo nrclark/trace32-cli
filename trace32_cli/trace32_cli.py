@@ -13,6 +13,7 @@ from .t32run import usb_reset, Trace32Subprocess
 from .t32run import find_trace32_dir, find_trace32_bin, Podbus
 
 from .t32iface import Trace32Interface
+from .version import __version__
 
 # --------------------------------------------------------------------------- #
 
@@ -402,6 +403,9 @@ def create_parser():
     top_parser = argparse.ArgumentParser(parents=parent_common)
     top_parser.description = """Command-line tool that uses Lauterbach Trace32
     to control a target device."""
+
+    top_parser.add_argument('-V', '--version', action='version',
+                            version='%(prog)s ' + __version__)
 
     subparsers = top_parser.add_subparsers(title='Available commands',
                                            dest="subcommand",
