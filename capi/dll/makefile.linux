@@ -1,0 +1,109 @@
+
+#                TRACE32 Remote API
+#      Copyright (c) 1998-2020 Lauterbach GmbH
+#                All rights reserved
+#
+#                    GNU Makefile
+
+CROSS_COMPILE ?=
+empty :=
+space := $(empty) $(empty)
+
+GCC_MACHINE := $(shell $(CROSS_COMPILE)gcc -dumpmachine)
+GCC_ARCH    := $(word 1,$(subst -,$(space),$(GCC_MACHINE)))
+ifeq ($(GCC_MACHINE),arm-linux-gnueabihf)
+  GCC_ARCH  := armhf
+endif
+GCC_OS      := $(word 2,$(subst -,$(space),$(GCC_MACHINE)))
+
+OS_NAME     ?= $(GCC_OS)
+ARCH_NAME   ?= $(GCC_ARCH)
+
+CC := $(CROSS_COMPILE)gcc
+RM := rm
+MKDIR := mkdir
+CFLAGS  := -pipe -c -MMD -MP -fPIC -Wall -Wextra -Wno-missing-field-initializers -O2 -g -DENABLE_NOTIFICATION 
+LDFLAGS := -shared
+CFLAGS-arm    :=
+CFLAGS-armhf  :=
+CFLAGS-aarch64:=
+CFLAGS-x86    := -m32
+CFLAGS-x86_64 := -m64
+
+ifneq ($(findstring $(ARCH_NAME),arm armhf),)
+  CFLAGS32 := $(CFLAGS-$(ARCH_NAME))
+  CFLAGS64 :=
+  TARGETS  := rel32
+  ODIR32   := linux-$(ARCH_NAME)
+  ODIR64   :=
+else ifneq ($(findstring $(ARCH_NAME),aarch64),)
+  CFLAGS32 :=
+  CFLAGS64 := $(CFLAGS-$(ARCH_NAME))
+  TARGETS  := rel64
+  ODIR32   :=
+  ODIR64   := linux-$(ARCH_NAME)
+else
+  CFLAGS32 := $(CFLAGS-x86)
+  CFLAGS64 := $(CFLAGS-x86_64)
+  TARGETS  := rel32 rel64
+  ODIR32   := linux
+  ODIR64   := linux64
+endif
+
+SDIR := ../src
+TARGETLIB32 := t32api.so
+TARGETLIB64 := t32api64.so
+
+SRCS := hremote.c hlinknet.c
+DEPS := $(SRCS:%.c=%.d)
+OBJS := $(SRCS:%.c=%.o)
+
+OBJS32 := $(addprefix $(ODIR32)/,$(OBJS))
+OBJS64 := $(addprefix $(ODIR64)/,$(OBJS))
+DEPS32 := $(addprefix $(ODIR32)/,$(DEPS))
+DEPS64 := $(addprefix $(ODIR64)/,$(DEPS))
+
+.PHONY: help
+help:
+	@echo
+	@echo make help ... show this help
+	@echo make all .... same as make rel
+	@echo make rel .... build t32api.so and t32api64.so
+ifneq ($(findstring rel32,$(TARGETS)),)
+	@echo make rel32 .. build t32api.so
+endif
+ifneq ($(findstring rel64,$(TARGETS)),)
+	@echo make rel64 .. build t32api64.so
+endif
+	@echo make clean .. delete directories $(ODIR32) $(ODIR64)
+	@echo
+
+.PHONY: all
+all: rel
+
+rel: $(TARGETS)
+
+rel32: $(ODIR32)/$(TARGETLIB32)
+
+rel64: $(ODIR64)/$(TARGETLIB64)
+
+$(ODIR64) $(ODIR32):
+	$(MKDIR) $@
+
+$(ODIR32)/$(TARGETLIB32): $(OBJS32)
+	$(CC) $(LDFLAGS) $(CFLAGS32) -o $@ $^
+
+$(ODIR64)/$(TARGETLIB64): $(OBJS64)
+	$(CC) $(LDFLAGS) $(CFLAGS64) -o $@ $^
+
+$(ODIR32)/%.o : $(SDIR)/%.c | $(ODIR32)
+	$(CC) $(CFLAGS) $(CFLAGS32) -I$(SDIR) -o $@ $<
+
+$(ODIR64)/%.o : $(SDIR)/%.c | $(ODIR64)
+	$(CC) $(CFLAGS) $(CFLAGS64) -I$(SDIR) -o $@ $<
+
+-include $(DEPS32) $(DEPS64)
+
+.PHONY: clean extraclean
+clean extraclean:
+	-$(RM) -rf $(ODIR32) $(ODIR64)

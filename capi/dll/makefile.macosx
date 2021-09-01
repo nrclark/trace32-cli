@@ -1,0 +1,39 @@
+
+#                TRACE32 Remote API
+#      Copyright (c) 1998-2020 Lauterbach GmbH
+#                All rights reserved
+#
+#                    Mac OS Makefile
+#
+# Builds TRACE32 API shared library. Requires Xtools to be installed.
+
+SRCS := hremote.c hlinknet.c
+OBJS := $(SRCS:%.c=%.o)
+TARGETLIB := t32api.dylib
+DEPS := ../src/t32.h
+VPATH := ../src
+
+CC := clang
+CFLAGS := -c -fPIC
+LDFLAGS := -lc -Wl,-undefined,dynamic_lookup,-install_name,$(TARGETLIB), -o $(TARGETLIB) -current_version 1.0.0 -compatibility_version 1.0
+
+RM := rm
+
+.PHONY: help
+help:
+	@echo
+	@echo "make help  ... Show this help"
+	@echo "make all ..... Build the shared library (64bits only)"
+	@echo "make clean ... Delete library, objects and dependencies"
+	@echo
+
+.PHONY: all
+all: $(TARGETLIB)
+
+$(TARGETLIB): $(OBJS)
+	$(CC) -dynamiclib  $(LDFLAGS) $(OBJS)
+
+
+.PHONY: clean extraclean
+clean extraclean:
+	-$(RM) -rf $(TARGETLIB) $(OBJS)

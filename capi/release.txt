@@ -1,0 +1,60 @@
+
+Version 4.5
+
+- Extend TAP Access API to support ARM DAP, AHB, APB, AIX, JTAG-AP, SWD.
+- New functions: T32_DirectAccessResetAll, T32_DirectAccessSetInfo, T32_DirectAccessGetInfo,
+  T32_TAPAccessJTAGResetWithTMS, T32_TAPAccessJTAGResetWithTRST, T32_TAPAccessSetShiftPattern,
+  T32_DAPAccessScan, T32_DAPAccessInitSWD, T32_DAPAPAccessReadWrite
+
+Version 4.4
+
+- T32_Terminate(), T32_SetMode() documented. Buffer size corrections for T32_GetMessage()/T32_GetTriggerMessage()
+
+Version 4.3
+
+- new functions: T32_ReadVariableValue(), T32_ReadVariableString(), T32_ReadRegisterByName(), T32_GetBreakpointList()
+
+Version 4.2
+
+- Cleanup, clarifications
+
+Version 4.1
+
+- new commands T32_TAPACCESS_SLEEP_MS, T32_TAPACCESS_SLEEP_US, T32_TAPACCESS_SLEEP_HALF_CLOCK
+
+Version 4.0 SP 3
+
+- added 64bit DLL files
+
+Version 4.0 SP 2
+
+- changed directory hierarchy and added DLL examples
+
+Version 4.0 SP 1
+
+- documentation bug (endianess) for T32_GetCpuInfo() corrected
+
+Version 4.0
+
+- changed sources to serve multiple debuggers (backward compatible)
+- added T32_GetChannel*(), T32_SetChannel()
+
+Version 3.6
+
+- added T32_TAPACCESS_nENOUT
+
+Version 3.5
+
+- Added T32_SubCoreDebug() T32_TAPAccess*() and T32_GetPracticeState
+- Commands wait for completion (no timeout)
+
+Version 3.4 SP 2
+
+- Changed hlinknet.c, hremote.c and t32.h (compiler warnings)
+- Changed makefile to define windows defines
+
+Version 3.4 SP 1
+
+- Changed Makefile to use Visual Studio Compiler
+- Changed source files to compile under Win (#defines)
+- Changed hrtest.c to connect to "localhost" (instead of "sun2")
