@@ -464,9 +464,9 @@ def create_parser():
 
     check_modes = ("full", "checksum", "sparse", "none")
     parser.add_argument("-c", "--check", required=False, metavar="MODE",
-                        default="none", choices=check_modes, help="""Checking
-                        mode for written data. Known modes are: [%(choices)s].
-                        (default: %(default)s).""")
+                        default="full", choices=check_modes,
+                        help="""Verification mode for written data. Known modes
+                        are: [%(choices)s]. (default: %(default)s).""")
 
     parser.add_argument("-s", "--scratchpad", required=False,
                         metavar="SPADDRESS", help="""Address for the 64kB
@@ -475,7 +475,7 @@ def create_parser():
                         is used. (default: %(default)s).""", type=constant)
 
     parser.add_argument("-b", "--blocksize", help="""Maximum blocksize to use
-                        for read operations (default: %(default)s).""",
+                        for write operations (default: %(default)s).""",
                         default="1M", type=constant)
 
     # ----------------------------------------------------------------------- #
