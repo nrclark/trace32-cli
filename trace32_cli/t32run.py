@@ -128,32 +128,39 @@ class ThreadedPopen(sp.Popen):
     def __init__(self, *args, **kwargs):
         self._shutdown = False
         self._threads = []
-        self._queues = {
-            'ctrl': queue.Queue(),
-            'stdin': queue.Queue(),
-            'stdout': queue.Queue(),
-            'stderr': queue.Queue()
-        }
+        self._queues = {}
 
-        kwargs['stdin'] = sp.PIPE
-        kwargs['stdout'] = sp.PIPE
-        kwargs['stderr'] = sp.PIPE
         kwargs['bufsize'] = 0
+        for stream in ('stdin', 'stdout', 'stderr'):
+            if kwargs.get(stream, None) == sp.PIPE:
+                self._queues[stream] = queue.Queue()
 
         super().__init__(*args, **kwargs)
-        self._buftype = type(self.stdout.read(0))
 
-        args = (self.stdout, self._queues['stdout'], "read")
-        thread = threading.Thread(target=self._service_pipe, args=args)
-        self._threads.append(thread)
+        # Author's note: the logic behind bytes/str selection was taken
+        # from the help page for the Subprocess module.
+        self._buftype = bytes
 
-        args = (self.stderr, self._queues['stderr'], "read")
-        thread = threading.Thread(target=self._service_pipe, args=args)
-        self._threads.append(thread)
+        # pylint: disable=no-member
+        if (self.encoding is not None) and (self.errors is not None):
+            if not self.universal_newlines:
+                self._buftype = str
+        # pylint: enable=no-member
 
-        args = (self.stdin, self._queues['stdin'], "write")
-        thread = threading.Thread(target=self._service_pipe, args=args)
-        self._threads.append(thread)
+        if kwargs.get('stdout', None) == sp.PIPE:
+            args = (self.stdout, self._queues['stdout'], "read")
+            thread = threading.Thread(target=self._service_pipe, args=args)
+            self._threads.append(thread)
+
+        if kwargs.get('stderr', None) == sp.PIPE:
+            args = (self.stderr, self._queues['stderr'], "read")
+            thread = threading.Thread(target=self._service_pipe, args=args)
+            self._threads.append(thread)
+
+        if kwargs.get('stdin', None) == sp.PIPE:
+            args = (self.stdin, self._queues['stdin'], "write")
+            thread = threading.Thread(target=self._service_pipe, args=args)
+            self._threads.append(thread)
 
         for thread in self._threads:
             thread.start()
@@ -162,7 +169,8 @@ class ThreadedPopen(sp.Popen):
         if self._shutdown is False:
             self._queues['stdin'].put(self._buftype())
             for pipe in [self.stdin, self.stdout, self.stderr]:
-                pipe.close()
+                if pipe is not None:
+                    pipe.close()
             self._shutdown = True
 
     @_add_doc(sp.Popen.terminate.__doc__)
@@ -239,17 +247,26 @@ class ThreadedPopen(sp.Popen):
         """ Writes a block of data to the Trace32 subprocess. Can be called
         prior to launching run() if desired. """
 
+        if 'stdin' not in self._queues:
+            raise IOError("ThreadedPopen() wasn't created with stdin=PIPE")
+
         self._queues['stdin'].put(data)
 
     def read_stdout(self):
         """ Gets all data waiting in the Trace32 subprocess's stdout queue,
         and returns it as a single string. """
 
+        if 'stdout' not in self._queues:
+            raise IOError("ThreadedPopen() wasn't created with stdout=PIPE")
+
         return self._read_queue(self._queues['stdout'])
 
     def read_stderr(self):
         """ Gets all data waiting in the Trace32 subprocess's stderr queue,
         and returns it as a single string. """
+
+        if 'stderr' not in self._queues:
+            raise IOError("ThreadedPopen() wasn't created with stderr=PIPE")
 
         return self._read_queue(self._queues['stderr'])
 
@@ -452,10 +469,10 @@ class Trace32Subprocess:
         return -1
 
     def start(self):
-        """ Runs {self.t32bin} as a subprocess with pipe-connected stdin,
-        stdout, and stderr attached to thread-serviced queues, and returns the
-        active popen instance. I/O can be accessed with popen.write_stdin(),
-        popen.read_stdout(), and popen.read_stderr() respectively."""
+        """ Runs {self.t32bin} as a subprocess. Stdin is pipe-connected and
+        attached to a thread-serviced queue, although TRACE32 doesn't seem to
+        use it. Stdout is redirected to /dev/null, because TRACE32 doesn't use
+        it for communication either. Stderr is passed through unmodified."""
 
         cmd = [self.t32bin, "-c", self.config_file]
 
@@ -466,7 +483,9 @@ class Trace32Subprocess:
             extra_arg = {"start_new_session": True}
 
         self._dummy_socket.close()
-        self.popen = ThreadedPopen(cmd, **extra_arg)
+        self.popen = ThreadedPopen(cmd, stdin=sp.PIPE, stdout=sp.DEVNULL,
+                                   **extra_arg)
+
         register_cleanup(self.popen.kill)
 
 
