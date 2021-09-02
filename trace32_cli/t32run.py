@@ -301,6 +301,8 @@ class Trace32Subprocess:
         return self
 
     def __exit__(self, exception_type, exception_val, trace):
+        graceful_exit = 0
+
         if self.popen is None:
             return
 

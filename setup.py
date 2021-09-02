@@ -144,10 +144,30 @@ class update_libnames(build_ext):
     def run(self):
         result = super().run()
         ext_map = {}
+
         for extension in self.extensions:
+            # Author's note: at the time of this writing, setuptools' build_ext
+            # puts a duplicate copy of each extension in the Python base
+            # directory when generating an .tar.gz distribution (but not when
+            # generating a wheel). This fix removes the duplicates without
+            # perturbing the originals.
+
+            extfile = self.get_ext_filename(extension.name)
+            in_subdir = bool(os.path.dirname(extfile))
+
+            if in_subdir:
+                extfile = os.path.basename(extfile)
+                root_file = os.path.join(self.build_lib, extfile)
+                if os.path.exists(root_file):
+                    os.unlink(root_file)
+
+        for extension in self.extensions:
+            reference = re.search('[^.]+$', extension.name).group(0)
+            actual = os.path.basename(self.get_ext_filename(extension.name))
+
             ext_map[extension.name] = {
-                "reference": f"{extension.name}.so",
-                "actual": self.get_ext_filename(extension.name)
+                "reference": f"{reference}.so",
+                "actual": actual
             }
 
         python_files = []
@@ -184,7 +204,7 @@ if __name__ == "__main__":
         cmdclass={'build_py': prebuild_files,
                   'build_ext': update_libnames},
         ext_modules = [
-            Extension('_t32api',
+            Extension('trace32_cli._t32api',
                 include_dirs = [os.path.join('capi', 'src')],
                 sources = [
                     'rw_assist.c',

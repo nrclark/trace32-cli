@@ -276,7 +276,10 @@ class Trace32API:
     def __init__(self, libfile=None):
         if libfile is None:
             script_dir = os.path.abspath(os.path.dirname(__file__))
-            libfile = os.path.join(script_dir, "_t32api.so")
+            libfile = os.path.join(
+                script_dir,
+                "_t32api.so"
+            )
 
         libfile = os.path.abspath(libfile)
         self.dll = ctypes.cdll.LoadLibrary(libfile)
