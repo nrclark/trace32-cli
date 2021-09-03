@@ -149,17 +149,20 @@ class ThreadedPopen(sp.Popen):
 
         if kwargs.get('stdout', None) == sp.PIPE:
             args = (self.stdout, self._queues['stdout'], "read")
-            thread = threading.Thread(target=self._service_pipe, args=args)
+            thread = threading.Thread(target=self._service_pipe, args=args,
+                                      daemon=True)
             self._threads.append(thread)
 
         if kwargs.get('stderr', None) == sp.PIPE:
             args = (self.stderr, self._queues['stderr'], "read")
-            thread = threading.Thread(target=self._service_pipe, args=args)
+            thread = threading.Thread(target=self._service_pipe, args=args,
+                                      daemon=True)
             self._threads.append(thread)
 
         if kwargs.get('stdin', None) == sp.PIPE:
             args = (self.stdin, self._queues['stdin'], "write")
-            thread = threading.Thread(target=self._service_pipe, args=args)
+            thread = threading.Thread(target=self._service_pipe, args=args,
+                                      daemon=True)
             self._threads.append(thread)
 
         for thread in self._threads:
@@ -306,12 +309,15 @@ class Trace32Subprocess:
 
     @staticmethod
     def _api_quit(libfile, port):
-        api = Trace32API(libfile)
-        api.T32_Config("NODE=", "localhost")
-        api.T32_Config("PORT=", port)
-        api.T32_Init()
-        api.T32_Terminate(1)
-        api.T32_Exit()
+        try:
+            api = Trace32API(libfile)
+            api.T32_Config("NODE=", "localhost")
+            api.T32_Config("PORT=", port)
+            api.T32_Init()
+            api.T32_Terminate(1)
+            api.T32_Exit()
+        except KeyboardInterrupt:
+            sys.exit(1)
 
     def __enter__(self):
         self.start()

@@ -143,7 +143,7 @@ class Trace32Interface:
             api.T32_Init()
             api.T32_Attach()
             api.T32_Exit()
-        except CommunicationError:
+        except (KeyboardInterrupt, CommunicationError):
             sys.exit(1)
 
     def connect(self, node="localhost", port=20000, packlen=None, timeout=10):

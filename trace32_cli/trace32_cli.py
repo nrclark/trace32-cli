@@ -9,10 +9,12 @@ import os
 import io
 import time
 
+from .t32api import CallFailure
+
 from .t32run import usb_reset, Trace32Subprocess
 from .t32run import find_trace32_dir, find_trace32_bin, Podbus
 
-from .t32iface import Trace32Interface
+from .t32iface import Trace32Interface, CommandFailure
 from .version import __version__
 
 # --------------------------------------------------------------------------- #
@@ -32,7 +34,20 @@ def read(args, iface: Trace32Interface):
 
     while received < length:
         chunksize = min(args.blocksize, length - received)
-        block = iface.read_memory(args.address + received, chunksize)
+        address = args.address + received
+
+        args.log(f"Reading {chunksize} bytes from {hex(address)}", level=3)
+        for retries in range(1, 9):
+            try:
+                block = iface.read_memory(address, chunksize)
+                break
+            except CallFailure as err:
+                msg = f"Read attempt {retries} failed. Retrying read "
+                msg += f"from {hex(address)}."
+                args.log(msg, level=1)
+        else:
+            raise err
+
         assert len(block) == chunksize
 
         if outfile is None:
@@ -49,77 +64,133 @@ def read(args, iface: Trace32Interface):
         outfile.close()
 
 
-def _write_api(args, iface: Trace32Interface):
-    """ Write data to memory using C-API calls. Knows 'none' and 'full'
-    modes. """
+def api_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
+                    args: argparse.Namespace):
 
-    address = args.address
+    """ Read a block of data from infile, and write it to an address in the
+    target's memory using C API calls. Optionally do a readback if args.check
+    is 'full'. Retry reads, writes, and readbacks up to 8 times. """
 
-    while True:
-        block = args.infile.read(args.blocksize)
+    block = infile.read(args.blocksize)
 
-        if not block:
-            return True
+    if not block:
+        return 0
 
-        args.log(f"Writing {len(block)} bytes to {hex(address)}", level=3)
-        iface.write_memory(address, block)
+    args.log(f"Writing {len(block)} bytes to {hex(address)} via API", level=3)
 
-        if args.check == "full":
-            msg = f"Verifying {len(block)} bytes at {hex(address)}"
-            args.log(msg, level=3)
-            readback = iface.read_memory(address, len(block))
-            assert readback == block
+    for block_tries in range(1, 9):
+        for call_tries in range(1, 9):
+            try:
+                iface.write_memory(address, block)
+                break
+            except CallFailure as err:
+                msg = f"Write attempt {call_tries} failed. Retrying write "
+                msg += f"to {hex(address)}."
+                args.log(msg, level=1)
+        else:
+            raise err
 
-        address += len(block)
+        if args.check != "full":
+            break
+
+        msg = f"Verifying {len(block)} bytes at {hex(address)}"
+        args.log(msg, level=3)
+
+        for call_tries in range(1, 9):
+            try:
+                readback = iface.read_memory(address, len(block))
+                break
+            except CallFailure as err:
+                msg = f"Read attempt {call_tries} failed. Retrying read "
+                msg += f"from {hex(address)}."
+                args.log(msg, level=1)
+        else:
+            raise err
+
+        if readback == block:
+            break
+
+        msg = f"Readback attempt {block_tries} mismatch. Retrying block "
+        msg += f"for {hex(address)}."
+        args.log(msg, level=1)
+    else:
+        raise IOError(f"Hit retry limit on write/verify to {hex(address)}")
+
+    return len(block)
 
 
-def _write_practice(args, iface: Trace32Interface):
+def cmd_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
+                    args: argparse.Namespace):
+
     """ Write data to memory using PRACTICE DATA.LOAD.BINARY commands. Knows
     how to use "sparse" and "checksum" modes. """
 
-    address = args.address
-    logfile = args.logdest if (args.verbosity >= 3) else None
-    base_command = 'Data.LOAD.Binary @filename @start++@size'
-    completed = 0
+    if infile.seekable() and os.path.isfile(infile.name):
+        position = infile.tell()
+        length = infile.seek(0, os.SEEK_END)
 
-    if args.infile.seekable() and os.path.isfile(args.infile.name):
-        buffer_file = None
-        base_command = base_command.replace("@filename", args.infile.name)
-        base_command += " /SKIP @skip"
-        total = args.infile.seek(0, io.SEEK_END)
+        size = min(args.blocksize, length - position)
+        if size == 0:
+            return 0
+
+        infile.seek(position + size, os.SEEK_SET)
+        command = f'Data.LOAD.Binary "{infile.name}"'
+        command += f' {hex(address)}++{hex(size - 1)}'
+        command += f" /SKIP {hex(position)}"
+
     else:
         buffer_file = os.path.join(iface.tempdir, "buffer.bin")
-        base_command = base_command.replace("@filename", buffer_file)
-        total = None
+        block = infile.read(args.blocksize)
+        size = len(block)
+        if size == 0:
+            return 0
+
+        with open(buffer_file, "wb") as outfile:
+            outfile.write(block)
+
+        command = f'Data.LOAD.Binary "{buffer_file}"'
+        command += f' {hex(address)}++{hex(size - 1)}'
 
     if args.check == "sparse":
-        base_command += " /PVerify"
+        command += " /PVerify"
     else:
-        base_command += f" /CHECKLOAD {hex(args.scratchpad)}++0xFFFF"
+        scratchpad_avoid(address, size, args.scratchpad)
+        command += f" /CHECKLOAD {hex(args.scratchpad)}++0xFFFF"
 
-    while True:
-        if buffer_file:
-            block = args.infile.read(args.blocksize)
-            with open(buffer_file, "wb") as outfile:
-                outfile.write(block)
-            chunksize = len(block)
-        else:
-            chunksize = min(total - completed, args.blocksize)
+    args.log(f"Writing {size} bytes to {hex(address)} via CMD", level=3)
+    args.log(f"Running [{command}]", level=3)
+    logfile = args.logdest if (args.verbosity >= 3) else None
 
-        if chunksize == 0:
-            return
+    for retries in range(1, 9):
+        try:
+            iface.run_command(command, logfile=logfile)
+            return size
+        except (CallFailure, CommandFailure) as err:
+            msg = f"Write attempt {retries} failed. Retrying command "
+            msg += f"for {hex(address)}."
+            args.log(msg, level=1)
 
-        if args.check == "checksum":
-            scratchpad_avoid(address, chunksize, args.scratchpad)
+    raise err
 
-        cmd = base_command.replace("@start", hex(address))
-        cmd = cmd.replace("@size", hex(chunksize - 1))
-        cmd = cmd.replace("@skip", hex(completed))
 
-        args.log(f"Running [{cmd}]", level=3)
-        iface.run_command(cmd, logfile=logfile)
-        completed += chunksize
-        address += chunksize
+def stringify_size(size):
+    """ Returns a normalized/formatted version of 'size', for human
+    consumption. """
+
+    if size == 1:
+        return "1 byte"
+
+    suffixes = ["bytes", "kB", "MB", "GB"]
+
+    for suffix in suffixes:
+        if size < 1024:
+            if round(size) == size:
+                return f"{round(size)} {suffix}"
+
+            return f"{round(size, 1)} {suffix}"
+        size = size / 1024
+
+    return f"{round(size * 1024)} {suffix}"
 
 
 def write(args, iface: Trace32Interface):
@@ -131,17 +202,56 @@ def write(args, iface: Trace32Interface):
     else:
         args.log("Using stdin as input.", level=1)
 
+    infile = args.infile
     address = args.address
+    length = None
+
+    if infile.seekable() and os.path.isfile(infile.name):
+        length = infile.seek(0, os.SEEK_END)
+        infile.seek(0, os.SEEK_SET)
+
     msg = f"Writing to {hex(address)} with a verify-mode of [{args.check}]."
     args.log(msg, level=1)
 
     if args.check in ("none", "full"):
-        return _write_api(args, iface)
+        writer = api_write_block
+    elif args.check in ("sparse", "checksum"):
+        writer = cmd_write_block
+    else:
+        raise ValueError(f"Unknown checker mode [{args.check}]")
 
-    if args.check in ("sparse", "checksum"):
-        return _write_practice(args, iface)
+    count = None
+    total = 0
+    show_progress = sys.stdout.isatty() and not args.quiet
+    prev_time = time.time() - 10
+    prev_progress = None
 
-    raise ValueError(f"Unknown checker mode [{args.check}]")
+    while True:
+        if count == 0:
+            break
+
+        if show_progress:
+            current_time = time.time()
+
+            if ((current_time - prev_time) < 0.5) and (count != 0):
+                continue
+
+            prev_time = current_time
+            progress_string = f"written: {stringify_size(total)}"
+            if length is not None:
+                percentage = round(100.0 * total / length)
+                progress_string += " (%.1f%%)" % percentage
+
+            if prev_progress:
+                sys.stdout.write("\r" + " " * len(prev_progress) + "\r")
+                sys.stdout.flush()
+
+            sys.stdout.write(progress_string + " ")
+            sys.stdout.flush()
+            prev_progress = progress_string
+
+        count = writer(infile, address + total, iface, args)
+        total += count
 
 
 def run(args, iface: Trace32Interface):
@@ -162,9 +272,9 @@ def run(args, iface: Trace32Interface):
 
 
 def scratchpad_avoid(start, length, scratchpad, scratchpad_size=64*1024):
-    """ Checks to see if a scratchpad overlaps with the address range that
-    spans from lower_bound to upper_bound. Throws an exception if it does.
-    This function can be used to ensure that a checksum scratchpad won't
+    """ Checks to see if a scratchpad overlaps with the region of memory that
+    starts at [start] and ihas a size of [length]. Throws an exception if it
+    does. This function can be used to ensure that a checksum scratchpad won't
     accidentally clobber the memory that it's trying to checkum. """
     # pylint: disable=chained-comparison
 
@@ -478,6 +588,9 @@ def create_parser():
                         for write operations (default: %(default)s).""",
                         default="1M", type=constant)
 
+    parser.add_argument("-q", "--quiet", action="store_true", help="""Suppress
+                        progress reporting.""")
+
     # ----------------------------------------------------------------------- #
 
     parser = subparsers.add_parser('run', help='Run a PRACTICE command',
@@ -628,13 +741,20 @@ def main():
         return _cli()
 
     try:
-        # pylint: disable=broad-except
         return _cli()
 
-    except Exception as err:
+    except KeyboardInterrupt:
+        print("Aborted.")
+        sys.exit(1)
+
+    except Exception as err:  # pylint: disable=broad-except
         dump_exception(err)
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    if not exit_code:
+        sys.exit(0)
+    else:
+        sys.exit(int(exit_code))
