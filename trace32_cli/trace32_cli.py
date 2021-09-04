@@ -20,6 +20,73 @@ from .version import __version__
 # --------------------------------------------------------------------------- #
 
 
+class Reporter:
+    """ Class for printing the progress on a read/write operation. Logs
+    the number of bytes processed, and also the % complete (if known). """
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, size=None, poll=0.25, prefix="", outfile=sys.stdout):
+        self.size = size
+        self.total = 0
+        self.prefix = prefix
+        self.outfile = outfile
+        self.poll = poll
+        self.next_time = 0
+        self.prev_progress = None
+        self.rounded = False
+
+    def stringify_size(self, value):
+        """ Returns a normalized/formatted version of 'value' for human
+        consumption. """
+
+        if value == 1:
+            return "1 byte"
+
+        suffixes = ["bytes", "kB", "MB", "GB"]
+
+        for suffix in suffixes:
+            if value < 1024:
+                if not self.rounded and (round(value) == value):
+                    return f"{round(value)} {suffix}"
+
+                self.rounded = True
+                return "%.1f %s" % (float(round(value, 1)), suffix)
+            value = value / 1024
+
+        return f"{round(value * 1024)} {suffix}"
+
+    def __call__(self, count=0):
+        """ Adds count to the total progress. Prints the total progress to
+        self.outfile. """
+
+        self.total += count
+
+        current_time = time.monotonic()
+        if current_time < self.next_time:
+            return
+
+        self.next_time = current_time + self.poll
+        progress_string = f"{self.prefix}{self.stringify_size(self.total)}"
+
+        if self.size is not None:
+            percentage = float(round(100.0 * self.total / self.size, 1))
+            progress_string += " (%.1f%%)" % percentage
+
+        progress_string += " "
+
+        if self.prev_progress:
+            if self.prev_progress == progress_string:
+                return
+
+            eraser = "\r" + " " * len(self.prev_progress) + "\r"
+            self.outfile.write(eraser + progress_string)
+        else:
+            self.outfile.write(progress_string)
+
+        self.prev_progress = progress_string
+        self.outfile.flush()
+
+
 def read(args, iface: Trace32Interface):
     """ Routine for reading data from the target's memory, and writing to
     stdout or to an outfile. """
@@ -31,6 +98,12 @@ def read(args, iface: Trace32Interface):
         length = os.path.getsize(args.reference)
     else:
         length = args.count
+
+    reporter = None
+
+    if args.logdest.isatty() and not args.quiet:
+        reporter = Reporter(length, prefix="read: ", outfile=args.logdest)
+        reporter(0)
 
     while received < length:
         chunksize = min(args.blocksize, length - received)
@@ -44,7 +117,7 @@ def read(args, iface: Trace32Interface):
             except CallFailure as err:
                 msg = f"Read attempt {retries} failed. Retrying read "
                 msg += f"from {hex(address)}."
-                args.log(msg, level=1)
+                args.log(msg, level=2)
         else:
             raise err
 
@@ -59,6 +132,9 @@ def read(args, iface: Trace32Interface):
 
         outfile.write(block)
         received += chunksize
+
+        if reporter:
+            reporter(len(block))
 
     if args.outfile is not None:
         outfile.close()
@@ -86,7 +162,7 @@ def api_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
             except CallFailure as err:
                 msg = f"Write attempt {call_tries} failed. Retrying write "
                 msg += f"to {hex(address)}."
-                args.log(msg, level=1)
+                args.log(msg, level=2)
         else:
             raise err
 
@@ -103,7 +179,7 @@ def api_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
             except CallFailure as err:
                 msg = f"Read attempt {call_tries} failed. Retrying read "
                 msg += f"from {hex(address)}."
-                args.log(msg, level=1)
+                args.log(msg, level=2)
         else:
             raise err
 
@@ -112,7 +188,7 @@ def api_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
 
         msg = f"Readback attempt {block_tries} mismatch. Retrying block "
         msg += f"for {hex(address)}."
-        args.log(msg, level=1)
+        args.log(msg, level=2)
     else:
         raise IOError(f"Hit retry limit on write/verify to {hex(address)}")
 
@@ -173,26 +249,6 @@ def cmd_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
     raise err
 
 
-def stringify_size(size):
-    """ Returns a normalized/formatted version of 'size', for human
-    consumption. """
-
-    if size == 1:
-        return "1 byte"
-
-    suffixes = ["bytes", "kB", "MB", "GB"]
-
-    for suffix in suffixes:
-        if size < 1024:
-            if round(size) == size:
-                return f"{round(size)} {suffix}"
-
-            return f"{round(size, 1)} {suffix}"
-        size = size / 1024
-
-    return f"{round(size * 1024)} {suffix}"
-
-
 def write(args, iface: Trace32Interface):
     """ Routine for writing data to the target's memory from stdin or an
     infile. """
@@ -222,35 +278,19 @@ def write(args, iface: Trace32Interface):
 
     count = None
     total = 0
-    show_progress = sys.stdout.isatty() and not args.quiet
-    prev_time = time.time() - 10
-    prev_progress = None
+    reporter = None
+
+    if args.logdest.isatty() and not args.quiet:
+        reporter = Reporter(length, prefix="written: ", outfile=args.logdest)
+        reporter(0)
 
     while True:
+        count = writer(infile, address + total, iface, args)
+        reporter(count)
+
         if count == 0:
             break
 
-        if show_progress:
-            current_time = time.time()
-
-            if ((current_time - prev_time) < 0.5) and (count != 0):
-                continue
-
-            prev_time = current_time
-            progress_string = f"written: {stringify_size(total)}"
-            if length is not None:
-                percentage = round(100.0 * total / length)
-                progress_string += " (%.1f%%)" % percentage
-
-            if prev_progress:
-                sys.stdout.write("\r" + " " * len(prev_progress) + "\r")
-                sys.stdout.flush()
-
-            sys.stdout.write(progress_string + " ")
-            sys.stdout.flush()
-            prev_progress = progress_string
-
-        count = writer(infile, address + total, iface, args)
         total += count
 
 
@@ -551,6 +591,9 @@ def create_parser():
     group.add_argument("-c", "--count", help="""Number of bytes to read,
                        starting at ADDRESS and counting upwards.""",
                        type=constant)
+
+    parser.add_argument("-q", "--quiet", action="store_true", help="""Suppress
+                        progress reporting.""")
 
     # ----------------------------------------------------------------------- #
 
