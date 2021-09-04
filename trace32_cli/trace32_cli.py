@@ -360,6 +360,9 @@ def constant(input_string):
     """ Evaluate a string as a numerical constant and return it. Try to convert
     the string from a number of different formats. """
 
+    if input_string is None:
+        return None
+
     value = input_string.strip().lower()
 
     if re.match("^[0-9]+[.]$", value):
@@ -405,6 +408,9 @@ def trace32_binary(input_string):
     """ Confirms that 'input_string' can be traced to a valid Trace32
     binary of the requested name. """
 
+    if input_string is None:
+        return None
+
     value = input_string.strip()
 
     try:
@@ -420,6 +426,9 @@ def path_readable(filename):
     """ Confirms that filename is a file that can be opened and read. Raises
     an ArgumentError otherwise. """
 
+    if filename is None:
+        return None
+
     try:
         open(filename, 'rb').close()
     except Exception as err:
@@ -432,6 +441,9 @@ def path_readable(filename):
 def path_writeable(filename):
     """ Confirms that filename is a file that can be opened for writing. Raises
     an ArgumentError otherwise. """
+
+    if filename is None:
+        return None
 
     try:
         if os.path.exists(filename):
@@ -576,7 +588,7 @@ def create_parser():
 
     parser.add_argument("-b", "--blocksize", help="""Maximum blocksize to use
                         for read operations (default: %(default)s).""",
-                        default="1M", type=constant)
+                        default="64k", type=constant)
 
     parser.add_argument("-o", "--outfile", help="""Output file to write
                         (default: stdout).""", type=path_writeable)
@@ -628,8 +640,9 @@ def create_parser():
                         is used. (default: %(default)s).""", type=constant)
 
     parser.add_argument("-b", "--blocksize", help="""Maximum blocksize to use
-                        for write operations (default: %(default)s).""",
-                        default="1M", type=constant)
+                        for write operations (default: 64k for 'full' and
+                        'none' modes, 1M for 'sparse' and 'checksum').""",
+                        default=None, type=constant)
 
     parser.add_argument("-q", "--quiet", action="store_true", help="""Suppress
                         progress reporting.""")
@@ -696,6 +709,12 @@ def run_parser(parser):
         if args.infile.seekable():
             length = args.infile.seek(0, io.SEEK_END)
             scratchpad_avoid(args.address, length, args.scratchpad)
+
+    if args.subcommand == 'write' and args.blocksize is None:
+        if args.check in ('checksum', 'sparse'):
+            args.blocksize = constant('1M')
+        else:
+            args.blocksize = constant('64k')
 
     return args
 
