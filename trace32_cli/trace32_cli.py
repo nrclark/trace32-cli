@@ -244,7 +244,7 @@ def cmd_write_block(infile: io.IOBase, address: int, iface: Trace32Interface,
         except (CallFailure, CommandFailure) as err:
             msg = f"Write attempt {retries} failed. Retrying command "
             msg += f"for {hex(address)}."
-            args.log(msg, level=1)
+            args.log(msg, level=2)
 
     raise err
 
