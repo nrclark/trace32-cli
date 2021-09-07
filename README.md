@@ -63,7 +63,7 @@ These options can be found on all subcommands:
 
 ## `Read` Options ##
  - `-b`/`--blocksize <blocksize>`: Maximum size (in bytes) to use for each
-   internal read operation. Defaults to 1MB.
+   internal read operation. Defaults to 64kB.
  - `-o`/`--outfile <outfile>`: Output file to write. If unspecified, data will
    be written to stdout.
  - `-c`/`--count <size>`: Read <size> number of bytes from the target. This
@@ -73,7 +73,8 @@ These options can be found on all subcommands:
 
 ## `Write` Options ##
  - `-b`/`--blocksize <blocksize>`: Maximum size (in bytes) to use for each
-   internal write operation. Defaults to 1MB.
+   internal write operation. Defaults to 1MB for `--check=checksum` and
+   `--check=sparse`, and 64kB otherwise.
  - `-s`/`--spaddress <address>`: Address to use for 64kB scratchpad region, if
    using `checksum`-based write verification (see below).
  - `-c`/`--check <mode>`: Mode to use for checking that data was written to
