@@ -1,2 +1,5 @@
 include VERSION
+include maintainer.mk
+include trace32-cli.py
+include Makefile
 graft capi
