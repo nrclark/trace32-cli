@@ -151,6 +151,22 @@ These options can be found on all subcommands:
    ```
    $ cat bootloader.bin | trace32-cli -u -H header.cmm write --check=checksum --scratchpad=0x73000000 0x78000000
    ```
+
+# Installation #
+
+`Trace32-cli` is available for some systems on Cruise's internal Pypi server.
+To install it on a system with access to our Artifactory server, you can use
+`pip` as shown below:
+
+```
+$ pip3 install --upgrade --extra-index-url="https://artifactory.robot.car/artifactory/api/pypi/wheels-python-local/simple" trace32-cli
+```
+
+At the time of this writing, a source package and a Python 3.6/Linux/x86-64
+package (for Ubuntu 18.04) have been published to the server. The source package
+should be installable on any machine with a working C compiler, although it's
+untested on Windows.
+
 # Build Instructions #
 
 `Trace32-cli` is packaged as a standard Python package with binary extensions
