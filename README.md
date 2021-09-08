@@ -152,6 +152,21 @@ These options can be found on all subcommands:
    $ cat bootloader.bin | trace32-cli -u -H header.cmm write --check=checksum --scratchpad=0x73000000 0x78000000
    ```
 
+# Requirements #
+
+`Trace32-cli` needs a fairly recent version of TRACE32 to work, because it uses
+Lauterbach's TCP/IP API instead of the older unreliable UDP one. Make sure
+you've got a version of TRACE32 that was released in 2021 or newer.
+
+At the time of this writing, only USB-connected debug probes are supported.
+Network-connected probes are a planned feature in the next release.
+
+Python 3.6 or newer is required.
+
+This tool also has only been tested on x86-64 Linux. It probably also
+works fine on MacOS. Windows hasn't been tested, although there's no
+architectural reason why `trace32-cli` wouldn't work there.
+
 # Installation #
 
 `Trace32-cli` is available for some systems on Cruise's internal Pypi server.
